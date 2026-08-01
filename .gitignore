@@ -1,0 +1,12 @@
+.dotnet/
+.dotnet_cli/
+.nuget/
+.vs/
+.idea/
+bin/
+obj/
+artifacts/
+*.user
+*.suo
+*.pdb
+.DS_Store
