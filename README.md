@@ -2,7 +2,7 @@
 
 Desktopowa aplikacja Windows 11 do monitorowania faktur otrzymanych w Krajowym Systemie e-Faktur (KSeF API 2.0) oraz miesięcznego obrotu usług prywatnych z MyDR.
 
-Aktualny etap: działająca wersja `0.5.0`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
+Aktualny etap: działająca wersja `0.5.1`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
 
 ## Zaimplementowane
 
@@ -84,7 +84,7 @@ Test obejmuje:
 - miesięczne sumowanie kwot brutto i rozdzielanie różnych walut;
 - protokół OAuth MyDR, dokładny zestaw pól formularza, produkcyjny host, Bearer token i rotację Refresh Tokena;
 - paginację prywatnych wizyt MyDR bez używania hosta z pola `next`;
-- klasyfikację wykonanych wizyt, ścisłe parsowanie wartości usług i dzienny harmonogram czasu polskiego;
+- klasyfikację wykonanych wizyt, bezpieczne parsowanie tekstowych i liczbowych wartości usług oraz dzienny harmonogram czasu polskiego;
 - redakcję sekretów w zwykłym oraz rotowanym dzienniku;
 - generowanie i odszyfrowanie żądania RSA-OAEP;
 - cały przebieg challenge → auth → status → redeem;
@@ -151,6 +151,7 @@ Plików `.dat` nie da się odszyfrować na innym koncie Windows. Usunięcie fold
 - pobierane są cztery widoczne miesiące: bieżący i trzy poprzednie;
 - źródłem są wizyty prywatne w stanach `Do rozliczenia`, `Oczekuje na płatność`, `Zakończona`, `Zamknięta` lub `Archiwalna`;
 - miesiąc jest wyznaczany z pola `Visit.date`, a kwota jako suma pola `value` usług zwróconych przez `GET /visits/{id}/services/`;
+- pole `value` jest przyjmowane zarówno jako liczba JSON, jak i tekst dziesiętny, ponieważ rzeczywista odpowiedź MyDR może różnić się typem od publicznego schematu;
 - aplikacja nie zapisuje danych pacjentów, nazw personelu ani nazw usług; lokalnie pozostają tylko identyfikator wizyty, data, stan, znacznik modyfikacji, liczba usług i suma;
 - automatyczna próba ponownie pobiera wszystkie usługi wykonanych wizyt z bieżącego miesiąca; dla trzech starszych miesięcy pobiera je ponownie, gdy zmieniło się `latest_modification`; ręczne `Odśwież teraz` celowo przelicza wszystkie wykonane wizyty w czterech miesiącach i może wykorzystać znacznie więcej wywołań API;
 - niepełna odpowiedź lub niepoprawna kwota przerywa nową migawkę, dzięki czemu ostatni poprawny wynik nie zostaje zastąpiony zaniżoną sumą;

@@ -469,7 +469,40 @@ static async Task TestMyDrProtocolAsync()
         {
             servicesRequestSeen = true;
             return Json(HttpStatusCode.OK,
-                """[{"id":101,"quantity":2,"base_price":"100.00","discount":"10.00","value":"190.00"},{"id":102,"quantity":1,"base_price":"50.00","discount":"0.00","value":"50.00"}]""");
+                """[{"id":"101","name":{"historyczny_format":true},"quantity":"2.00","base_price":100.00,"discount":10.00,"value":190.00},{"id":102,"insurer_service_code":12345,"quantity":1,"base_price":"50.00","discount":null,"value":"50.00"}]""");
+        }
+
+        if (path.EndsWith("/visits/12/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK,
+                """[{"id":201,"quantity":2,"base_price":"100.00","discount":"10.00","value":"190.00"}]""");
+        }
+
+        if (path.EndsWith("/visits/13/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK,
+                """{"count":1,"next":null,"results":[{"id":301,"value":"190.00"}]}""");
+        }
+
+        if (path.EndsWith("/visits/14/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK,
+                """[{"id":401,"name":"DANE_MEDYCZNE_TEST","value":"DANE_MEDYCZNE_TEST"}]""");
+        }
+
+        if (path.EndsWith("/visits/15/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK, """[{"id":501,"value":null}]""");
+        }
+
+        if (path.EndsWith("/visits/16/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK, """[{"id":601,"value":-10.50},{"id":602,"value":"-0.50"}]""");
+        }
+
+        if (path.EndsWith("/visits/17/services/", StringComparison.Ordinal))
+        {
+            return Json(HttpStatusCode.OK, "[]");
         }
 
         return Json(HttpStatusCode.NotFound, """{"detail":"Nieobsłużona ścieżka testowa"}""");
@@ -495,19 +528,52 @@ static async Task TestMyDrProtocolAsync()
     Require(requestedPages.SequenceEqual([1, 2]) && visits.Select(visit => visit.Id).SequenceEqual([11L, 12L]),
         "Klient MyDR nie obsłużył bezpiecznie paginacji lub filtra wizyt prywatnych.");
     var services = await client.GetVisitServicesAsync(11, timeout.Token);
-    Require(servicesRequestSeen && services.Sum(MyDrApiClient.GetServiceGrossValue) == 240m,
-        "Klient MyDR nie obliczył sumy pola value usług.");
+    Require(servicesRequestSeen &&
+            services.Select(service => service.Id).SequenceEqual([101L, 102L]) &&
+            services.Sum(MyDrApiClient.GetServiceGrossValue) == 240m,
+        "Klient MyDR nie obsłużył produkcyjnego wariantu liczba/tekst w polach usług.");
+    var documentedServices = await client.GetVisitServicesAsync(12, timeout.Token);
+    Require(documentedServices.Sum(MyDrApiClient.GetServiceGrossValue) == 190m,
+        "Klient MyDR przestał obsługiwać udokumentowany tekstowy format kwot.");
+    var corrections = await client.GetVisitServicesAsync(16, timeout.Token);
+    Require(corrections.Sum(MyDrApiClient.GetServiceGrossValue) == -11m,
+        "Klient MyDR nie zachował ujemnych wartości korekt.");
+    var emptyServices = await client.GetVisitServicesAsync(17, timeout.Token);
+    Require(emptyServices.Count == 0,
+        "Klient MyDR nie zaakceptował poprawnej pustej listy usług.");
 
-    var malformed = new MyDrAttachedPrivateService { Id = 1, Value = "wartość-nieprawidłowa" };
     try
     {
-        _ = MyDrApiClient.GetServiceGrossValue(malformed);
-        throw new InvalidOperationException("Klient MyDR zaakceptował niepoprawną kwotę.");
+        _ = await client.GetVisitServicesAsync(13, timeout.Token);
+        throw new InvalidOperationException("Klient MyDR zaakceptował nieudokumentowany obiekt zamiast tablicy usług.");
     }
     catch (MyDrApiException exception)
     {
-        Require(!exception.Message.Contains(malformed.Value, StringComparison.Ordinal),
-            "Wyjątek parsera MyDR ujawnił surową wartość odpowiedzi.");
+        Require(exception.Message.Contains("otrzymano obiekt", StringComparison.Ordinal),
+            "Błąd struktury usług nie wskazuje bezpiecznie rodzaju odpowiedzi.");
+    }
+
+    try
+    {
+        _ = await client.GetVisitServicesAsync(14, timeout.Token);
+        throw new InvalidOperationException("Klient MyDR zaakceptował niepoprawną kwotę usługi.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(!exception.Message.Contains("DANE_MEDYCZNE_TEST", StringComparison.Ordinal),
+            "Wyjątek parsera MyDR ujawnił treść odpowiedzi medycznej.");
+    }
+
+    var missingValue = await client.GetVisitServicesAsync(15, timeout.Token);
+    try
+    {
+        _ = MyDrApiClient.GetServiceGrossValue(missingValue.Single());
+        throw new InvalidOperationException("Klient MyDR potraktował brak kwoty jako zero.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(exception.Message.Contains("kwoty brutto", StringComparison.OrdinalIgnoreCase),
+            "Brak kwoty usługi nie zwrócił bezpiecznego komunikatu.");
     }
 }
 

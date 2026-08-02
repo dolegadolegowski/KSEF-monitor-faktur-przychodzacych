@@ -108,36 +108,16 @@ internal sealed class MyDrVisit
 internal sealed class MyDrAttachedPrivateService
 {
     [JsonPropertyName("id")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
     public long Id { get; set; }
 
-    [JsonPropertyName("name")]
-    public string? Name { get; set; }
-
-    [JsonPropertyName("insurer_service_code")]
-    public string? InsurerServiceCode { get; set; }
-
-    [JsonPropertyName("quantity")]
-    public int? Quantity { get; set; }
-
-    [JsonPropertyName("base_price")]
-    public string? BasePrice { get; set; }
-
-    [JsonPropertyName("discount")]
-    public string? Discount { get; set; }
-
     [JsonPropertyName("value")]
-    public string? Value { get; set; }
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public decimal? Value { get; set; }
 
     public decimal GetGrossValue()
     {
-        const NumberStyles styles =
-            NumberStyles.AllowLeadingWhite |
-            NumberStyles.AllowTrailingWhite |
-            NumberStyles.AllowLeadingSign |
-            NumberStyles.AllowDecimalPoint;
-
-        if (string.IsNullOrWhiteSpace(Value) ||
-            !decimal.TryParse(Value, styles, CultureInfo.InvariantCulture, out var result))
+        if (Value is not { } result)
             throw new MyDrApiException("MyDR nie zwrócił poprawnej kwoty brutto dla jednej z usług.");
 
         return result;

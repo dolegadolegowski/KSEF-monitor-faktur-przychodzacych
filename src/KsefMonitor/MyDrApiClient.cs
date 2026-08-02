@@ -65,7 +65,7 @@ internal sealed class MyDrApiClient : IDisposable
             BaseAddress = ProductionBaseUri,
             Timeout = TimeSpan.FromSeconds(60)
         };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.5.0 (Windows 11)");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.5.1 (Windows 11)");
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
@@ -158,10 +158,7 @@ internal sealed class MyDrApiClient : IDisposable
         using var response = await SendAuthorizedGetAsync(
             $"visits/{visitId.ToString(CultureInfo.InvariantCulture)}/services/",
             cancellationToken).ConfigureAwait(false);
-        var services = await DeserializeAsync<List<MyDrAttachedPrivateService>>(
-            response,
-            "MyDR zwrócił niepoprawną listę usług wizyty.",
-            cancellationToken).ConfigureAwait(false);
+        var services = await DeserializeServiceListAsync(response, cancellationToken).ConfigureAwait(false);
 
         if (services is null)
             throw new MyDrApiException("MyDR zwrócił niepełną listę usług wizyty.");
@@ -171,6 +168,45 @@ internal sealed class MyDrApiClient : IDisposable
             throw new MyDrApiException("MyDR zwrócił tę samą usługę więcej niż jeden raz.");
 
         return services;
+    }
+
+    private static async Task<List<MyDrAttachedPrivateService>> DeserializeServiceListAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                var receivedKind = document.RootElement.ValueKind switch
+                {
+                    JsonValueKind.Object => "obiekt",
+                    JsonValueKind.String => "tekst",
+                    JsonValueKind.Number => "liczbę",
+                    JsonValueKind.True or JsonValueKind.False => "wartość logiczną",
+                    JsonValueKind.Null => "null",
+                    _ => "inny format"
+                };
+                throw new MyDrApiException(
+                    $"MyDR zwrócił niepoprawną listę usług wizyty: oczekiwano tablicy JSON, otrzymano {receivedKind}.");
+            }
+
+            return document.RootElement.Deserialize<List<MyDrAttachedPrivateService>>(JsonOptions)
+                   ?? throw new MyDrApiException("MyDR zwrócił niepełną listę usług wizyty.");
+        }
+        catch (MyDrApiException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (exception is JsonException or NotSupportedException)
+        {
+            // Nie logujemy odpowiedzi ani wyjątku parsera: elementy mogą zawierać
+            // nazwy usług lub inne dane medyczne. DTO celowo odczytuje tylko id i value.
+            throw new MyDrApiException(
+                "MyDR zwrócił niepoprawną listę usług wizyty: typ jednego z wymaganych pól jest niezgodny z dokumentacją.");
+        }
     }
 
     public static decimal GetServiceGrossValue(MyDrAttachedPrivateService service)
