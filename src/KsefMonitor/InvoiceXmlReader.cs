@@ -25,19 +25,25 @@ internal static class InvoiceXmlReader
         var result = new InvoiceDocument();
         if (xdoc.Root is null) return result;
 
-        AddSummary(result, "Numer faktury", FirstValue(xdoc, "P_2", "NumerFaktury"));
-        AddSummary(result, "Data wystawienia", FirstValue(xdoc, "P_1", "DataWystawienia"));
-        AddSummary(result, "Waluta", FirstValue(xdoc, "KodWaluty"));
-        AddSummary(result, "Termin płatności", FirstValue(xdoc, "TerminPlatnosci", "Termin"));
-        AddSummary(result, "Forma płatności", FirstValue(xdoc, "FormaPlatnosci", "PlatnoscForma"));
-        AddSummary(result, "Rachunek bankowy", FirstValue(xdoc, "NrRB", "NumerRachunkuBankowego"));
+        AddSummary(result, "Numer faktury", FirstValue(xdoc, "P_2", "NumerFaktury", "ID"));
+        AddSummary(result, "Data wystawienia", FirstValue(xdoc, "P_1", "DataWystawienia", "IssueDate"));
+        AddSummary(result, "Data sprzedaży", FirstValue(xdoc, "P_6", "DataSprzedazy", "ActualDeliveryDate"));
+        AddSummary(result, "Waluta", FirstValue(xdoc, "KodWaluty", "DocumentCurrencyCode"));
+        AddSummary(result, "Termin płatności", FirstValue(xdoc, "Termin", "PaymentDueDate", "DueDate"));
+        AddSummary(result, "Forma płatności", FirstValue(xdoc, "FormaPlatnosci", "PlatnoscForma", "PaymentMeansCode"));
+        AddSummary(result, "Do zapłaty", FirstValue(xdoc, "DoZaplaty", "PayableAmount", "DuePayableAmount"));
 
-        var subject1 = FirstElement(xdoc, "Podmiot1", "Seller", "Supplier");
-        var subject2 = FirstElement(xdoc, "Podmiot2", "Buyer", "Customer");
+        var subject1 = FirstElement(xdoc, "Podmiot1", "AccountingSupplierParty", "SellerTradeParty", "Seller", "Supplier");
+        var subject2 = FirstElement(xdoc, "Podmiot2", "AccountingCustomerParty", "BuyerTradeParty", "Buyer", "Customer");
         AddSummary(result, "Sprzedawca", FirstValue(subject1, "Nazwa", "Name"));
-        AddSummary(result, "NIP sprzedawcy", FirstValue(subject1, "NIP", "Nip", "TaxIdentifier"));
+        AddSummary(result, "NIP sprzedawcy", FirstValue(subject1, "NIP", "Nip", "TaxIdentifier", "CompanyID"));
+        AddSummary(result, "Adres sprzedawcy", FormatAddress(subject1));
         AddSummary(result, "Nabywca", FirstValue(subject2, "Nazwa", "Name"));
-        AddSummary(result, "NIP nabywcy", FirstValue(subject2, "NIP", "Nip", "TaxIdentifier"));
+        AddSummary(result, "NIP nabywcy", FirstValue(subject2, "NIP", "Nip", "TaxIdentifier", "CompanyID"));
+        AddSummary(result, "Adres nabywcy", FormatAddress(subject2));
+
+        var paymentAccount = FirstElement(xdoc, "RachunekBankowy", "PayeeFinancialAccount", "SpecifiedTradeSettlementPaymentMeans");
+        AddSummary(result, "Rachunek bankowy", FirstValue(paymentAccount, "NrRB", "IBANID", "ID"));
 
         foreach (var line in xdoc.Descendants().Where(x => NameIs(
                      x,
@@ -114,8 +120,15 @@ internal static class InvoiceXmlReader
         }
     }
 
-    private static XElement? FirstElement(XContainer document, params string[] names) =>
-        document.Descendants().FirstOrDefault(x => names.Any(name => NameIs(x, name)));
+    private static XElement? FirstElement(XContainer document, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var result = document.Descendants().FirstOrDefault(x => NameIs(x, name));
+            if (result is not null) return result;
+        }
+        return null;
+    }
 
     private static string FirstAttributeValue(XElement? element, params string[] names)
     {
@@ -128,7 +141,30 @@ internal static class InvoiceXmlReader
     private static string FirstValue(XContainer? document, params string[] names)
     {
         if (document is null) return string.Empty;
-        return document.Descendants().FirstOrDefault(x => names.Any(name => NameIs(x, name)))?.Value.Trim() ?? string.Empty;
+        foreach (var name in names)
+        {
+            var result = document.Descendants().FirstOrDefault(x => NameIs(x, name));
+            if (result is not null) return result.Value.Trim();
+        }
+        return string.Empty;
+    }
+
+    private static string FormatAddress(XContainer? party)
+    {
+        if (party is null) return string.Empty;
+        var line1 = FirstValue(party, "AdresL1");
+        var line2 = FirstValue(party, "AdresL2");
+        if (!string.IsNullOrWhiteSpace(line1) || !string.IsNullOrWhiteSpace(line2))
+            return string.Join(Environment.NewLine, new[] { line1, line2 }.Where(x => !string.IsNullOrWhiteSpace(x)));
+
+        var street = FirstValue(party, "StreetName", "LineOne");
+        var building = FirstValue(party, "BuildingNumber");
+        var postalCode = FirstValue(party, "PostalZone", "PostcodeCode");
+        var city = FirstValue(party, "CityName");
+        var country = FirstValue(party, "IdentificationCode", "CountryID");
+        var streetLine = string.Join(" ", new[] { street, building }.Where(x => !string.IsNullOrWhiteSpace(x)));
+        var cityLine = string.Join(" ", new[] { postalCode, city }.Where(x => !string.IsNullOrWhiteSpace(x)));
+        return string.Join(Environment.NewLine, new[] { streetLine, cityLine, country }.Where(x => !string.IsNullOrWhiteSpace(x)));
     }
 
     private static bool NameIs(XElement element, params string[] names) =>

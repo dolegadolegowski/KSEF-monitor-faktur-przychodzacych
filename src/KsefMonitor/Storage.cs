@@ -1,9 +1,14 @@
 using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace KsefMonitor;
 
@@ -16,6 +21,8 @@ internal static class AppPaths
     public static string SettingsFile => Path.Combine(Root, "settings.json");
     public static string StateFile => Path.Combine(Root, "invoices.dat");
     public static string TokenFile => Path.Combine(Root, "credential.dat");
+    public static string DownloadRateFile => Path.Combine(Root, "download-rate.dat");
+    public static string LogFile => Path.Combine(Root, "app.log");
 
     public static void EnsureCreated()
     {
@@ -23,6 +30,7 @@ internal static class AppPaths
     }
 }
 
+[SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Granica odczytu danych musi odzyskać kopię lub uruchomić aplikację z pustym stanem zamiast zakończyć proces.")]
 internal sealed class AppStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -33,6 +41,23 @@ internal sealed class AppStore
     };
 
     private readonly object _gate = new();
+    private readonly object _stateQueueGate = new();
+    private Task _stateWriteTail = Task.CompletedTask;
+    private string? _loadWarning;
+
+    public AppStore(ApplicationLog log) => Log = log;
+
+    public ApplicationLog Log { get; }
+
+    public string? ConsumeLoadWarning()
+    {
+        lock (_gate)
+        {
+            var warning = _loadWarning;
+            _loadWarning = null;
+            return warning;
+        }
+    }
 
     public AppSettings LoadSettings()
     {
@@ -40,12 +65,12 @@ internal sealed class AppStore
         {
             try
             {
-                if (!File.Exists(AppPaths.SettingsFile)) return new AppSettings();
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(AppPaths.SettingsFile), JsonOptions)
-                       ?? new AppSettings();
+                if (!FileOrBackupExists(AppPaths.SettingsFile)) return new AppSettings();
+                return ReadTextWithBackup(AppPaths.SettingsFile, "ustawień", DeserializeSettings);
             }
-            catch
+            catch (Exception exception)
             {
+                RecordLoadWarning("Nie udało się odczytać ustawień.", exception);
                 return new AppSettings();
             }
         }
@@ -65,12 +90,17 @@ internal sealed class AppStore
         {
             try
             {
-                if (!File.Exists(AppPaths.StateFile)) return new AppState();
-                var clear = WindowsDataProtection.Unprotect(File.ReadAllBytes(AppPaths.StateFile));
-                return JsonSerializer.Deserialize<AppState>(clear, JsonOptions) ?? new AppState();
+                if (!FileOrBackupExists(AppPaths.StateFile)) return new AppState();
+                var state = ReadProtectedWithBackup(
+                    AppPaths.StateFile,
+                    "lokalnego cache faktur",
+                    clear => JsonSerializer.Deserialize<AppState>(clear, JsonOptions)) ?? new AppState();
+                state.NormalizeAfterLoad();
+                return state;
             }
-            catch
+            catch (Exception exception)
             {
+                RecordLoadWarning("Nie udało się odczytać lokalnego cache faktur.", exception);
                 return new AppState();
             }
         }
@@ -78,10 +108,48 @@ internal sealed class AppStore
 
     public void SaveState(AppState state)
     {
+        SaveStateAsync(state).GetAwaiter().GetResult();
+    }
+
+    public Task SaveStateAsync(AppState state)
+    {
+        var snapshot = state.Snapshot();
+        lock (_stateQueueGate)
+        {
+            _stateWriteTail = _stateWriteTail.ContinueWith(
+                previous =>
+                {
+                    // Błąd wcześniejszego zapisu nie może zatrzymać nowszego stanu.
+                    _ = previous.Exception;
+                    SaveStateCore(snapshot);
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.DenyChildAttach,
+                TaskScheduler.Default);
+            return _stateWriteTail;
+        }
+    }
+
+    public void FlushStateWrites()
+    {
+        Task pending;
+        lock (_stateQueueGate) pending = _stateWriteTail;
+        pending.GetAwaiter().GetResult();
+    }
+
+    private void SaveStateCore(AppState state)
+    {
         lock (_gate)
         {
             var clear = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
-            AtomicWrite(AppPaths.StateFile, WindowsDataProtection.Protect(clear));
+            try
+            {
+                AtomicWrite(AppPaths.StateFile, WindowsDataProtection.Protect(clear));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
         }
     }
 
@@ -91,11 +159,15 @@ internal sealed class AppStore
         {
             try
             {
-                if (!File.Exists(AppPaths.TokenFile)) return null;
-                return Encoding.UTF8.GetString(WindowsDataProtection.Unprotect(File.ReadAllBytes(AppPaths.TokenFile)));
+                if (!FileOrBackupExists(AppPaths.TokenFile)) return null;
+                return ReadProtectedWithBackup(
+                    AppPaths.TokenFile,
+                    "tokena KSeF",
+                    clear => Encoding.UTF8.GetString(clear));
             }
-            catch
+            catch (Exception exception)
             {
+                RecordLoadWarning("Nie udało się odczytać tokena KSeF.", exception);
                 return null;
             }
         }
@@ -106,7 +178,52 @@ internal sealed class AppStore
         if (string.IsNullOrWhiteSpace(token)) throw new ArgumentException("Token KSeF nie może być pusty.", nameof(token));
         lock (_gate)
         {
-            AtomicWrite(AppPaths.TokenFile, WindowsDataProtection.Protect(Encoding.UTF8.GetBytes(token.Trim())));
+            var clear = Encoding.UTF8.GetBytes(token.Trim());
+            try
+            {
+                AtomicWrite(AppPaths.TokenFile, WindowsDataProtection.Protect(clear));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
+        }
+    }
+
+    public List<DateTimeOffset>? LoadDownloadAttempts()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                if (!FileOrBackupExists(AppPaths.DownloadRateFile)) return null;
+                return ReadProtectedWithBackup(
+                           AppPaths.DownloadRateFile,
+                           "licznika pobierania",
+                           clear => JsonSerializer.Deserialize<List<DateTimeOffset>>(clear, JsonOptions))
+                       ?? new List<DateTimeOffset>();
+            }
+            catch (Exception exception)
+            {
+                RecordLoadWarning("Nie udało się odczytać licznika pobierania.", exception);
+                return new List<DateTimeOffset>();
+            }
+        }
+    }
+
+    public void SaveDownloadAttempts(IReadOnlyList<DateTimeOffset> attempts)
+    {
+        lock (_gate)
+        {
+            var clear = JsonSerializer.SerializeToUtf8Bytes(attempts, JsonOptions);
+            try
+            {
+                AtomicWrite(AppPaths.DownloadRateFile, WindowsDataProtection.Protect(clear));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
         }
     }
 
@@ -115,15 +232,118 @@ internal sealed class AppStore
         lock (_gate)
         {
             if (File.Exists(AppPaths.TokenFile)) File.Delete(AppPaths.TokenFile);
+            if (File.Exists(AppPaths.TokenFile + ".bak")) File.Delete(AppPaths.TokenFile + ".bak");
+            if (File.Exists(AppPaths.TokenFile + ".tmp")) File.Delete(AppPaths.TokenFile + ".tmp");
         }
     }
 
     private static void AtomicWrite(string path, byte[] bytes)
     {
         var temp = path + ".tmp";
-        File.WriteAllBytes(temp, bytes);
-        File.Move(temp, path, true);
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+
+            if (File.Exists(path))
+                File.Replace(temp, path, path + ".bak", ignoreMetadataErrors: true);
+            else
+                File.Move(temp, path);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
     }
+
+    private static AppSettings DeserializeSettings(string json)
+    {
+        var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
+        settings.Nip ??= string.Empty;
+
+        // Starsze wersje pozwalały wybrać TEST/DEMO. Po przejściu na wyłącznie produkcyjny
+        // endpoint nie wolno automatycznie użyć tokena zapisanego dla innego środowiska.
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.TryGetProperty("Environment", out var environment) &&
+            !string.Equals(environment.ToString(), "Production", StringComparison.OrdinalIgnoreCase))
+            settings.RequiresProductionToken = true;
+        return settings;
+    }
+
+    private T ReadTextWithBackup<T>(string path, string description, Func<string, T> deserialize)
+    {
+        try
+        {
+            return deserialize(File.ReadAllText(path));
+        }
+        catch (Exception primaryException)
+        {
+            var backup = path + ".bak";
+            if (!File.Exists(backup)) throw;
+            try
+            {
+                var value = deserialize(File.ReadAllText(backup));
+                File.Copy(backup, path, overwrite: true);
+                RecordLoadWarning($"Odzyskano {description} z kopii zapasowej.", primaryException);
+                return value;
+            }
+            catch
+            {
+                throw new InvalidDataException($"Uszkodzony plik {description} i jego kopia zapasowa.", primaryException);
+            }
+        }
+    }
+
+    private T? ReadProtectedWithBackup<T>(string path, string description, Func<byte[], T?> deserialize)
+    {
+        try
+        {
+            return ReadProtected(path, deserialize);
+        }
+        catch (Exception primaryException)
+        {
+            var backup = path + ".bak";
+            if (!File.Exists(backup)) throw;
+            try
+            {
+                var value = ReadProtected(backup, deserialize);
+                File.Copy(backup, path, overwrite: true);
+                RecordLoadWarning($"Odzyskano {description} z kopii zapasowej.", primaryException);
+                return value;
+            }
+            catch
+            {
+                throw new InvalidDataException($"Uszkodzony plik {description} i jego kopia zapasowa.", primaryException);
+            }
+        }
+    }
+
+    private static T? ReadProtected<T>(string path, Func<byte[], T?> deserialize)
+    {
+        var clear = WindowsDataProtection.Unprotect(File.ReadAllBytes(path));
+        try
+        {
+            var value = deserialize(clear);
+            return value is null
+                ? throw new InvalidDataException("Chroniony plik nie zawiera oczekiwanych danych.")
+                : value;
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(clear);
+        }
+    }
+
+    private void RecordLoadWarning(string warning, Exception? exception = null)
+    {
+        _loadWarning = string.IsNullOrWhiteSpace(_loadWarning) ? warning : $"{_loadWarning} {warning}";
+        Log.Warning("Pamięć lokalna", warning, exception);
+    }
+
+    private static bool FileOrBackupExists(string path) => File.Exists(path) || File.Exists(path + ".bak");
 }
 
 internal static class WindowsDataProtection
@@ -193,6 +413,7 @@ internal static class WindowsDataProtection
     }
 
     [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CryptProtectData(
         ref NativeBlob pDataIn,
@@ -204,6 +425,7 @@ internal static class WindowsDataProtection
         ref NativeBlob pDataOut);
 
     [DllImport("crypt32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CryptUnprotectData(
         ref NativeBlob pDataIn,
@@ -215,5 +437,6 @@ internal static class WindowsDataProtection
         ref NativeBlob pDataOut);
 
     [DllImport("kernel32.dll")]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
     private static extern IntPtr LocalFree(IntPtr hMem);
 }

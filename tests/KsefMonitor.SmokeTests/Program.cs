@@ -1,6 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -33,8 +38,18 @@ Require(parsed.Lines[0].NetAmount == "200.00", "Nie odczytano wartości netto po
 Require(parsed.Fields.Count > 10, "Nie spłaszczono wszystkich pól XML.");
 TestGrossLineVariant();
 TestPefUblLineVariant();
+TestA4Pagination();
+TestMonthlyInvoiceSummary();
+TestInvoiceNewState();
+TestStateContextIsolation();
+TestStatusBanner();
+TestUserFacingErrors();
+TestApplicationLog();
 Require(NipValidator.IsValid("526-587-76-35"), "Walidacja poprawnego NIP-u nie działa.");
 Require(!NipValidator.IsValid("5265877634"), "Walidacja błędnego NIP-u nie działa.");
+Require(!NipValidator.IsValid("0000000000"), "Walidacja zaakceptowała techniczny, niepoprawny NIP.");
+Require(!NipValidator.IsValid("ABC5265877635"), "Walidacja zaakceptowała niedozwolone znaki w NIP-ie.");
+Require(AppSettings.GetBaseUri() == new Uri("https://api.ksef.mf.gov.pl/v2/"), "Aplikacja nie używa produkcyjnego endpointu KSeF.");
 await TestKsefProtocolAsync();
 
 Console.WriteLine("KSeFMonitor smoke tests: OK");
@@ -92,6 +107,211 @@ static void TestPefUblLineVariant()
     Require(line.VatRate == "23", "Nie odczytano stawki VAT pozycji PEF/UBL.");
 }
 
+static void TestA4Pagination()
+{
+    var shortInvoice = Enumerable.Range(1, 8)
+        .Select(index => new InvoiceLine(index.ToString(), $"Pozycja {index}", "1", "szt.", "10.00", string.Empty,
+            string.Empty, "10.00", string.Empty, "2.30", "23"))
+        .ToList();
+    Require(InvoicePagePlanner.Plan(shortInvoice).Count == 1, "Typowa krótka faktura została niepotrzebnie podzielona na strony.");
+
+    var lines = Enumerable.Range(1, 48)
+        .Select(index => new InvoiceLine(
+            index.ToString(),
+            index % 7 == 0 ? new string('A', 240) : $"Pozycja {index}",
+            "1",
+            "szt.",
+            "10.00",
+            string.Empty,
+            string.Empty,
+            "10.00",
+            string.Empty,
+            "2.30",
+            "23"))
+        .ToList();
+
+    var pages = InvoicePagePlanner.Plan(lines);
+    Require(pages.Count > 1, "Długi dokument nie został podzielony na strony A4.");
+    Require(pages[0].IsFirst && pages[^1].IsLast, "Niepoprawne oznaczenie pierwszej lub ostatniej strony A4.");
+    Require(pages.Sum(page => page.Lines.Count) == lines.Count, "Paginacja A4 zgubiła pozycje faktury.");
+    Require(pages.SelectMany(page => page.Lines).Select(line => line.Number).SequenceEqual(lines.Select(line => line.Number)),
+        "Paginacja A4 zmieniła kolejność pozycji faktury.");
+
+    var oversized = new InvoiceLine("1", new string('X', 20_000), "1", "szt.", "1.00", string.Empty,
+        string.Empty, "1.00", string.Empty, "0.23", "23");
+    var oversizedPages = InvoicePagePlanner.Plan([oversized]);
+    Require(InvoicePagePlanner.EstimateLineHeight(oversized) <= 600,
+        "Ekstremalnie długi opis może wyjść poza stronę A4.");
+    Require(oversizedPages.SelectMany(page => page.Lines).Single() == oversized,
+        "Paginacja zgubiła pozycję z bardzo długim opisem.");
+}
+
+static void TestStateContextIsolation()
+{
+    var attempt = DateTimeOffset.UtcNow.AddMinutes(-10);
+    var blockedUntil = DateTimeOffset.UtcNow.AddMinutes(5);
+    var state = new AppState
+    {
+        ContextNip = "5265877635",
+        HistoryMonthsBack = 3,
+        HistoricalBackfillBeforeIssueDate = new DateOnly(2026, 7, 1),
+        LastSuccessfulSyncUtc = DateTimeOffset.UtcNow,
+        PermanentStorageHwmDate = DateTimeOffset.UtcNow,
+        InvoiceDownloadBlockedUntilUtc = blockedUntil,
+        InvoiceDownloadAttemptsUtc = [attempt],
+        Invoices = new Dictionary<string, StoredInvoice>(StringComparer.Ordinal)
+        {
+            ["OLD-KSEF-NUMBER"] = new StoredInvoice { KsefNumber = "OLD-KSEF-NUMBER" }
+        }
+    };
+
+    var snapshot = state.Snapshot();
+    state.Invoices["OLD-KSEF-NUMBER"].SellerName = "Zmieniony sprzedawca";
+    Require(string.IsNullOrEmpty(snapshot.Invoices["OLD-KSEF-NUMBER"].SellerName),
+        "Migawka stanu współdzieli mutowalną fakturę z aktywnym cache.");
+    Require(snapshot.HistoryMonthsBack == 3, "Migawka stanu zgubiła wersję zakresu historii.");
+    Require(snapshot.HistoricalBackfillBeforeIssueDate == new DateOnly(2026, 7, 1),
+        "Migawka stanu zgubiła znacznik uzupełniania historii.");
+    Require(snapshot.InvoiceDownloadBlockedUntilUtc == blockedUntil,
+        "Migawka stanu zgubiła czas blokady pobierania zwrócony przez KSeF.");
+
+    Require(!state.BindToContext("5265877635"), "Ponowne przypisanie tego samego NIP-u zmieniło cache.");
+    Require(state.Invoices.Count == 1, "Cache został usunięty bez zmiany kontekstu.");
+    Require(state.BindToContext("1234563218"), "Zmiana NIP-u nie została wykryta.");
+    Require(state.Invoices.Count == 0, "Faktury poprzedniego NIP-u pozostały w cache.");
+    Require(state.PermanentStorageHwmDate is null && state.LastSuccessfulSyncUtc is null,
+        "Punkt synchronizacji poprzedniego NIP-u nie został wyzerowany.");
+    Require(state.HistoricalBackfillBeforeIssueDate is null,
+        "Zmiana NIP-u zachowała znacznik migracji poprzedniego kontekstu.");
+    Require(state.InvoiceDownloadBlockedUntilUtc is null,
+        "Zmiana NIP-u zachowała blokadę pobierania poprzedniego kontekstu.");
+    Require(state.InvoiceDownloadAttemptsUtc.SequenceEqual([attempt]),
+        "Zmiana kontekstu usunęła licznik limitu pobierania API.");
+}
+
+static void TestMonthlyInvoiceSummary()
+{
+    var invoices = new[]
+    {
+        new StoredInvoice { GrossAmount = 1234.50m, Currency = "PLN" },
+        new StoredInvoice { GrossAmount = 100.25m, Currency = "pln" },
+        new StoredInvoice { GrossAmount = 90m, Currency = " EUR " },
+        new StoredInvoice { GrossAmount = 10m, Currency = string.Empty }
+    };
+
+    var totals = MonthlyInvoiceSummary.CalculateGrossTotals(invoices);
+    Require(totals.Count == 2, "Podsumowanie nie rozdzieliło walut.");
+    Require(totals[0] == new CurrencyTotal("PLN", 1344.75m),
+        "Podsumowanie nie znormalizowało lub nie zsumowało kwot PLN.");
+    Require(totals[1] == new CurrencyTotal("EUR", 90m),
+        "Podsumowanie nie obliczyło kwoty EUR.");
+    var expectedPln = 1344.75m.ToString("N2", CultureInfo.GetCultureInfo("pl-PL"));
+    Require(MonthlyInvoiceSummary.FormatGrossTotals(invoices) == $"Łącznie brutto: {expectedPln} PLN  •  90,00 EUR",
+        "Podsumowanie nie używa polskiego formatu kwot.");
+    Require(MonthlyInvoiceSummary.FormatGrossTotals(Array.Empty<StoredInvoice>()) == "Łącznie brutto: 0,00 PLN",
+        "Pusty miesiąc nie ma jednoznacznego podsumowania.");
+}
+
+static void TestInvoiceNewState()
+{
+    var invoice = new StoredInvoice { KsefNumber = "KSEF-NEW", InvoiceNumber = "FV/NEW/1" };
+    var row = new InvoiceRow { Source = invoice };
+    Require(invoice.IsNew && row.IsNew && row.NewLabel == "NOWA",
+        "Nowa faktura nie otrzymała spójnego oznaczenia w modelu wiersza.");
+
+    var unopenedSnapshot = invoice.Snapshot();
+    invoice.ViewedAtUtc = DateTimeOffset.UtcNow;
+    Require(!invoice.IsNew && !row.IsNew && string.IsNullOrEmpty(row.NewLabel),
+        "Oznaczenie NOWA nie zniknęło po pierwszym otwarciu faktury.");
+    Require(unopenedSnapshot.IsNew,
+        "Zmiana oryginalnej faktury zmodyfikowała wcześniejszą migawkę listy.");
+    Require(!invoice.Snapshot().IsNew,
+        "Nowa migawka nie zachowała informacji o obejrzeniu faktury.");
+}
+
+static void TestStatusBanner()
+{
+    var now = DateTimeOffset.Parse("2026-08-02T10:00:00Z", CultureInfo.InvariantCulture);
+    var banner = new StatusBannerState(TimeSpan.FromSeconds(30));
+    banner.Apply(new AppStatusMessage("Gotowy."), now);
+    Require(!banner.Expire(now.AddHours(1)) && banner.Current?.Text == "Gotowy.",
+        "Zwykły status został niepotrzebnie ukryty.");
+
+    banner.Apply(new AppStatusMessage("Błąd", StatusSeverity.Error), now);
+    Require(banner.Current?.IsError == true && banner.ExpiresAtUtc == now.AddSeconds(30),
+        "Błąd na dolnej belce nie otrzymał czasu wygaśnięcia 30 sekund.");
+    Require(!banner.Expire(now.AddSeconds(29.999)), "Błąd zniknął przed upływem 30 sekund.");
+
+    banner.Apply(new AppStatusMessage("Nowszy błąd", StatusSeverity.Error), now.AddSeconds(20));
+    Require(!banner.Expire(now.AddSeconds(30)) && banner.Current?.Text == "Nowszy błąd",
+        "Stary termin wygaśnięcia usunął nowszy błąd.");
+    Require(banner.Expire(now.AddSeconds(50)) && banner.Current is null,
+        "Błąd nie zniknął po 30 sekundach.");
+
+    banner.Apply(new AppStatusMessage("Jeszcze jeden błąd", StatusSeverity.Error), now);
+    banner.Apply(new AppStatusMessage("Odświeżono poprawnie."), now.AddSeconds(5));
+    Require(!banner.Expire(now.AddMinutes(1)) && banner.Current?.Text == "Odświeżono poprawnie.",
+        "Termin starego błędu usunął nowszy komunikat informacyjny.");
+}
+
+static void TestUserFacingErrors()
+{
+    var unauthorized = UserFacingErrors.ForSynchronization(
+        new KsefApiException("KSeF HTTP 401: techniczny sekret", HttpStatusCode.Unauthorized));
+    Require(unauthorized.Contains("Sprawdź NIP i token", StringComparison.Ordinal) &&
+            !unauthorized.Contains("HTTP", StringComparison.OrdinalIgnoreCase) &&
+            !unauthorized.Contains("sekret", StringComparison.OrdinalIgnoreCase),
+        "Komunikat logowania nie jest prosty albo ujawnia szczegóły techniczne.");
+
+    var limited = UserFacingErrors.ForSynchronization(
+        new KsefApiException("KSeF HTTP 429", HttpStatusCode.TooManyRequests));
+    Require(limited.Contains("spróbuje ponownie", StringComparison.OrdinalIgnoreCase),
+        "Komunikat limitu KSeF nie wyjaśnia dalszego działania aplikacji.");
+
+    var network = UserFacingErrors.ForSynchronization(new HttpRequestException("DNS lookup failed"));
+    Require(network.Contains("internetem", StringComparison.OrdinalIgnoreCase) &&
+            !network.Contains("DNS", StringComparison.OrdinalIgnoreCase),
+        "Komunikat sieciowy pokazuje techniczny błąd DNS.");
+
+    var fallback = UserFacingErrors.ForSynchronization(new Exception("tajny techniczny szczegół"));
+    Require(fallback.Contains("dzienniku", StringComparison.OrdinalIgnoreCase) &&
+            !fallback.Contains("tajny", StringComparison.OrdinalIgnoreCase),
+        "Komunikat ogólny ujawnia treść wyjątku.");
+}
+
+static void TestApplicationLog()
+{
+    var directory = Path.Combine(Path.GetTempPath(), $"ksef-monitor-log-test-{Guid.NewGuid():N}");
+    var path = Path.Combine(directory, "app.log");
+    try
+    {
+        var log = new ApplicationLog(path);
+        log.Info("Test", "Pierwszy wpis");
+        log.Error("Test", "Operacja nie powiodła się", new InvalidOperationException("pełny szczegół diagnostyczny"));
+        Parallel.For(0, 20, index => log.Info("Równoległy test", $"Wpis {index}"));
+        var text = log.ReadRecent();
+        Require(text.Contains("[INFO] [Test] Pierwszy wpis", StringComparison.Ordinal), "Dziennik nie zachował wpisu informacyjnego.");
+        Require(text.Contains("pełny szczegół diagnostyczny", StringComparison.Ordinal), "Dziennik zgubił techniczny opis wyjątku.");
+        Require(Enumerable.Range(0, 20).All(index => text.Contains($"Wpis {index}", StringComparison.Ordinal)),
+            "Równoległy zapis skleił lub zgubił wpisy dziennika.");
+
+        var rotatingPath = Path.Combine(directory, "rotating.log");
+        var rotating = new ApplicationLog(rotatingPath, maximumFileBytes: 256);
+        rotating.Info("Rotacja", new string('A', 170));
+        rotating.Info("Rotacja", new string('B', 170));
+        Require(File.Exists(Path.Combine(directory, "rotating.previous.log")) && File.Exists(rotatingPath),
+            "Dziennik nie ogranicza rozmiaru przez rotację pliku.");
+        var rotatedText = rotating.ReadRecent();
+        Require(rotatedText.Contains(new string('A', 30), StringComparison.Ordinal) &&
+                rotatedText.Contains(new string('B', 30), StringComparison.Ordinal),
+            "Podgląd dziennika nie łączy poprzedniego i bieżącego pliku po rotacji.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
 static async Task TestKsefProtocolAsync()
 {
     using var rsa = RSA.Create(2048);
@@ -108,6 +328,10 @@ static async Task TestKsefProtocolAsync()
     const long timestampMs = 1785600000000;
     const string secret = "testowy-token-ksef";
     var querySeen = false;
+    var invoiceDownloadSeen = false;
+    var rateLimitNext = false;
+    var badRequestNext = false;
+    var metadataRanges = new List<(DateTimeOffset From, DateTimeOffset? To, bool RestrictToHwm)>();
 
     using var handler = new DelegateHandler(async (message, cancellationToken) =>
     {
@@ -146,8 +370,30 @@ static async Task TestKsefProtocolAsync()
             Require(message.Headers.Authorization?.Parameter == "access-token", "Brak AccessToken przy pobieraniu metadanych.");
             using var body = JsonDocument.Parse(await message.Content!.ReadAsStringAsync(cancellationToken));
             Require(body.RootElement.GetProperty("subjectType").GetString() == "Subject2", "Zapytanie nie dotyczy faktur otrzymanych.");
-            Require(body.RootElement.GetProperty("dateRange").GetProperty("dateType").GetString() == "PermanentStorage", "Zapytanie nie używa PermanentStorage.");
+            var dateRange = body.RootElement.GetProperty("dateRange");
+            Require(dateRange.GetProperty("dateType").GetString() == "PermanentStorage", "Zapytanie nie używa PermanentStorage.");
+            var restrictToHwm = dateRange.GetProperty("restrictToPermanentStorageHwmDate").GetBoolean();
+            var rangeFrom = dateRange.GetProperty("from").GetDateTimeOffset();
+            var rangeTo = dateRange.TryGetProperty("to", out var toElement) ? toElement.GetDateTimeOffset() : (DateTimeOffset?)null;
+            metadataRanges.Add((rangeFrom, rangeTo, restrictToHwm));
             querySeen = true;
+            if (badRequestNext)
+            {
+                badRequestNext = false;
+                return Json(HttpStatusCode.BadRequest, """
+                {
+                  "title":"Bad Request","status":400,"detail":"Żądanie jest nieprawidłowe.",
+                  "errors":[{"code":21183,"description":"Zakres filtrowania wykracza poza dostępny zakres danych.",
+                    "details":["Parametr dateRange.from jest późniejszy niż PermanentStorageHwmDate."]}]
+                }
+                """);
+            }
+            if (rateLimitNext)
+            {
+                var limited = Json(HttpStatusCode.TooManyRequests, """{"detail":"Limit żądań"}""");
+                limited.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(42));
+                return limited;
+            }
             return Json(HttpStatusCode.OK, """
             {
               "hasMore":false,"isTruncated":false,"permanentStorageHwmDate":"2026-08-01T12:00:00Z",
@@ -162,18 +408,75 @@ static async Task TestKsefProtocolAsync()
             """);
         }
 
+        if (path.EndsWith("/invoices/ksef/5265877635-20260801-TEST", StringComparison.Ordinal))
+        {
+            Require(message.Headers.Authorization?.Parameter == "access-token", "Brak AccessToken przy pobieraniu XML faktury.");
+            invoiceDownloadSeen = true;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("<Faktura><Fa><P_2>FV/TEST/1</P_2></Fa></Faktura>", Encoding.UTF8, "application/xml")
+            };
+        }
+
         return Json(HttpStatusCode.NotFound, """{"detail":"Nieobsłużona ścieżka testowa"}""");
     });
 
-    var settings = new AppSettings { Environment = KsefEnvironment.Test, Nip = "5265877635" };
+    var settings = new AppSettings { Nip = "5265877635" };
     using var client = new KsefApiClient(settings, secret, handler);
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     await client.AuthenticateAsync(timeout.Token);
+    await client.VerifyInvoiceReadAccessAsync(timeout.Token);
+    Require(metadataRanges.Count == 1 && !metadataRanges[0].RestrictToHwm,
+        "Test uprawnienia InvoiceRead może fałszywie zwrócić błąd HWM 21183.");
+    metadataRanges.Clear();
     var result = await client.QueryReceivedInvoicesAsync(DateTimeOffset.Parse("2026-07-01T00:00:00+02:00"), timeout.Token);
     Require(querySeen, "Nie wysłano zapytania o metadane.");
     Require(result.Invoices.Count == 1, "Nie odczytano metadanych z API.");
     Require(result.Invoices[0].SellerName == "Test Sp. z o.o.", "Nie odczytano nazwy sprzedawcy z API.");
     Require(result.Invoices[0].GrossAmount == 123.00m, "Nie odczytano kwoty brutto z API.");
+    var downloadedXml = await client.DownloadInvoiceXmlAsync("5265877635-20260801-TEST", timeout.Token);
+    Require(invoiceDownloadSeen && downloadedXml.Contains("FV/TEST/1", StringComparison.Ordinal),
+        "Klient nie pobrał pełnego XML faktury po numerze KSeF.");
+
+    metadataRanges.Clear();
+    var longRangeFrom = DateTimeOffset.UtcNow.AddMonths(-3);
+    var longRangeResult = await client.QueryReceivedInvoicesAsync(longRangeFrom, timeout.Token);
+    Require(metadataRanges.Count == 2, "Zakres dłuższy niż limit KSeF nie został podzielony na dwa okna.");
+    Require(metadataRanges.All(range => range.RestrictToHwm), "Synchronizacja nie ogranicza wszystkich okien do stabilnego HWM.");
+    Require(metadataRanges[0].From == longRangeFrom && metadataRanges[0].To == longRangeFrom.AddMonths(2),
+        "Pierwsze okno metadanych nie ma bezpiecznej długości dwóch miesięcy.");
+    Require(metadataRanges[0].To is { } firstWindowEnd &&
+            metadataRanges[1].From == firstWindowEnd && metadataRanges[1].To is null,
+        "Okna metadanych nie są przylegające lub ostatnie okno ma zbędną datę końcową.");
+    Require(longRangeResult.Invoices.Count == 1, "Deduplikacja faktur na granicach okien nie działa.");
+
+    badRequestNext = true;
+    try
+    {
+        await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient zignorował odpowiedź HTTP 400.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.BadRequest, "Nie zachowano kodu HTTP 400.");
+        Require(exception.HasErrorCode(21183), "Nie odczytano kodu 21183 z Problem Details.");
+        Require(exception.Message.Contains("Parametr dateRange.from", StringComparison.Ordinal),
+            "Komunikat zgubił właściwe szczegóły błędu KSeF.");
+        Require(!exception.Message.EndsWith("Żądanie jest nieprawidłowe.", StringComparison.Ordinal),
+            "Komunikat nadal pokazuje wyłącznie ogólny opis Problem Details.");
+    }
+
+    rateLimitNext = true;
+    try
+    {
+        await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient zignorował odpowiedź HTTP 429.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.TooManyRequests, "Nie zachowano kodu HTTP 429.");
+        Require(exception.RetryAfter is { TotalSeconds: >= 41 and <= 42 }, "Nie odczytano nagłówka Retry-After.");
+    }
 }
 
 static HttpResponseMessage Json(HttpStatusCode status, string json) => new(status)

@@ -8,6 +8,9 @@
   <ItemGroup>
     <Compile Include="..\..\src\KsefMonitor\Models.cs" Link="Models.cs" />
     <Compile Include="..\..\src\KsefMonitor\InvoiceXmlReader.cs" Link="InvoiceXmlReader.cs" />
+    <Compile Include="..\..\src\KsefMonitor\InvoicePresentation.cs" Link="InvoicePresentation.cs" />
     <Compile Include="..\..\src\KsefMonitor\KsefApiClient.cs" Link="KsefApiClient.cs" />
+    <Compile Include="..\..\src\KsefMonitor\ApplicationLog.cs" Link="ApplicationLog.cs" />
+    <Compile Include="..\..\src\KsefMonitor\UserFacingErrors.cs" Link="UserFacingErrors.cs" />
   </ItemGroup>
 </Project>

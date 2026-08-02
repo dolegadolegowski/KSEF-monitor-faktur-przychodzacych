@@ -2,46 +2,91 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.Json.Serialization;
 
 namespace KsefMonitor;
 
-internal enum KsefEnvironment
-{
-    Test,
-    Demo,
-    Production
-}
-
 internal sealed class AppSettings
 {
-    public KsefEnvironment Environment { get; set; } = KsefEnvironment.Test;
     public string Nip { get; set; } = string.Empty;
     public bool NotificationsEnabled { get; set; } = true;
 
-    public bool IsConfigured => NipValidator.IsValid(Nip);
+    [JsonIgnore]
+    public bool RequiresProductionToken { get; set; }
 
-    public Uri GetBaseUri() => Environment switch
-    {
-        KsefEnvironment.Test => new Uri("https://api-test.ksef.mf.gov.pl/v2/"),
-        KsefEnvironment.Demo => new Uri("https://api-demo.ksef.mf.gov.pl/v2/"),
-        _ => new Uri("https://api.ksef.mf.gov.pl/v2/")
-    };
+    public bool IsConfigured => NipValidator.IsValid(Nip) && !RequiresProductionToken;
 
-    public string EnvironmentLabel => Environment switch
-    {
-        KsefEnvironment.Test => "TEST",
-        KsefEnvironment.Demo => "DEMO",
-        _ => "PRODUKCJA"
-    };
+    public static Uri GetBaseUri() => new("https://api.ksef.mf.gov.pl/v2/");
 }
 
 internal sealed class AppState
 {
+    public string ContextNip { get; set; } = string.Empty;
+    public int HistoryMonthsBack { get; set; }
+    public DateOnly? HistoricalBackfillBeforeIssueDate { get; set; }
     public DateTimeOffset? LastSuccessfulSyncUtc { get; set; }
     public DateTimeOffset? LastMetadataSyncAttemptUtc { get; set; }
     public DateTimeOffset? PermanentStorageHwmDate { get; set; }
+    public DateTimeOffset? InvoiceDownloadBlockedUntilUtc { get; set; }
     public List<DateTimeOffset> InvoiceDownloadAttemptsUtc { get; set; } = new();
     public Dictionary<string, StoredInvoice> Invoices { get; set; } = new(StringComparer.Ordinal);
+
+    public bool BindToContext(string normalizedNip)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedNip)) return false;
+        if (string.IsNullOrWhiteSpace(ContextNip))
+        {
+            // Migracja cache ze starszej wersji. Zapisany stan należał do NIP-u
+            // przechowywanego w tych samych ustawieniach, więc nie usuwamy danych.
+            ContextNip = normalizedNip;
+            return true;
+        }
+
+        if (string.Equals(ContextNip, normalizedNip, StringComparison.Ordinal)) return false;
+
+        ContextNip = normalizedNip;
+        LastSuccessfulSyncUtc = null;
+        LastMetadataSyncAttemptUtc = null;
+        PermanentStorageHwmDate = null;
+        InvoiceDownloadBlockedUntilUtc = null;
+        HistoricalBackfillBeforeIssueDate = null;
+        Invoices.Clear();
+        // Limit pobrań jest liczony dla API i użytkownika, dlatego zachowujemy
+        // historię prób również po zmianie kontekstu.
+        return true;
+    }
+
+    public AppState Snapshot() => new()
+    {
+        ContextNip = ContextNip,
+        HistoryMonthsBack = HistoryMonthsBack,
+        HistoricalBackfillBeforeIssueDate = HistoricalBackfillBeforeIssueDate,
+        LastSuccessfulSyncUtc = LastSuccessfulSyncUtc,
+        LastMetadataSyncAttemptUtc = LastMetadataSyncAttemptUtc,
+        PermanentStorageHwmDate = PermanentStorageHwmDate,
+        InvoiceDownloadBlockedUntilUtc = InvoiceDownloadBlockedUntilUtc,
+        InvoiceDownloadAttemptsUtc = new List<DateTimeOffset>(InvoiceDownloadAttemptsUtc),
+        Invoices = Invoices.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.Snapshot(),
+            StringComparer.Ordinal)
+    };
+
+    public void NormalizeAfterLoad()
+    {
+        ContextNip ??= string.Empty;
+        InvoiceDownloadAttemptsUtc ??= new List<DateTimeOffset>();
+        Invoices ??= new Dictionary<string, StoredInvoice>(StringComparer.Ordinal);
+
+        var normalized = new Dictionary<string, StoredInvoice>(StringComparer.Ordinal);
+        foreach (var pair in Invoices)
+        {
+            if (string.IsNullOrWhiteSpace(pair.Key) || pair.Value is null) continue;
+            pair.Value.NormalizeAfterLoad(pair.Key);
+            normalized[pair.Key] = pair.Value;
+        }
+        Invoices = normalized;
+    }
 }
 
 internal sealed class StoredInvoice
@@ -86,12 +131,53 @@ internal sealed class StoredInvoice
         NetAmount = metadata.NetAmount;
         VatAmount = metadata.VatAmount;
         GrossAmount = metadata.GrossAmount;
-        Currency = metadata.Currency;
+        Currency = string.IsNullOrWhiteSpace(metadata.Currency) ? "PLN" : metadata.Currency;
         InvoiceType = metadata.InvoiceType;
         FormCode = metadata.FormCode;
         InvoicingMode = metadata.InvoicingMode;
         HasAttachment = metadata.HasAttachment;
         IsSelfInvoicing = metadata.IsSelfInvoicing;
+    }
+
+    public StoredInvoice Snapshot() => new()
+    {
+        KsefNumber = KsefNumber,
+        InvoiceNumber = InvoiceNumber,
+        IssueDate = IssueDate,
+        InvoicingDate = InvoicingDate,
+        AcquisitionDate = AcquisitionDate,
+        PermanentStorageDate = PermanentStorageDate,
+        SellerName = SellerName,
+        SellerNip = SellerNip,
+        BuyerName = BuyerName,
+        BuyerIdentifier = BuyerIdentifier,
+        NetAmount = NetAmount,
+        VatAmount = VatAmount,
+        GrossAmount = GrossAmount,
+        Currency = Currency,
+        InvoiceType = InvoiceType,
+        FormCode = FormCode,
+        InvoicingMode = InvoicingMode,
+        HasAttachment = HasAttachment,
+        IsSelfInvoicing = IsSelfInvoicing,
+        Xml = Xml,
+        DiscoveredAtUtc = DiscoveredAtUtc,
+        ViewedAtUtc = ViewedAtUtc,
+        NotifiedAtUtc = NotifiedAtUtc
+    };
+
+    public void NormalizeAfterLoad(string fallbackKsefNumber)
+    {
+        KsefNumber = string.IsNullOrWhiteSpace(KsefNumber) ? fallbackKsefNumber : KsefNumber;
+        InvoiceNumber ??= string.Empty;
+        SellerName ??= string.Empty;
+        SellerNip ??= string.Empty;
+        BuyerName ??= string.Empty;
+        BuyerIdentifier ??= string.Empty;
+        Currency = string.IsNullOrWhiteSpace(Currency) ? "PLN" : Currency;
+        InvoiceType ??= string.Empty;
+        FormCode ??= string.Empty;
+        InvoicingMode ??= string.Empty;
     }
 }
 
@@ -145,8 +231,11 @@ internal sealed class InvoiceDocument
 internal sealed class InvoiceRow
 {
     public required StoredInvoice Source { get; init; }
+    public bool IsNew => Source.IsNew;
     public string NewLabel => Source.IsNew ? "NOWA" : string.Empty;
-    public string IssueDate => Source.IssueDate.ToString("dd.MM.yyyy", CultureInfo.GetCultureInfo("pl-PL"));
+    public string IssueDate => Source.IssueDate == DateOnly.MinValue
+        ? "—"
+        : Source.IssueDate.ToString("dd.MM.yyyy", CultureInfo.GetCultureInfo("pl-PL"));
     public string Seller => string.IsNullOrWhiteSpace(Source.SellerName) ? Source.SellerNip : Source.SellerName;
     public string InvoiceNumber => Source.InvoiceNumber;
     public string GrossAmount => $"{Source.GrossAmount:N2} {Source.Currency}";
@@ -159,8 +248,10 @@ internal static class NipValidator
     public static bool IsValid(string? value)
     {
         if (string.IsNullOrWhiteSpace(value)) return false;
+        if (value.Any(character => !char.IsDigit(character) && character != '-' && !char.IsWhiteSpace(character))) return false;
         var nip = Normalize(value);
         if (nip.Length != 10) return false;
+        if (nip.Distinct().Count() == 1) return false;
         int[] weights = [6, 5, 7, 2, 3, 4, 5, 6, 7];
         var sum = weights.Select((weight, index) => weight * (nip[index] - '0')).Sum();
         var checksum = sum % 11;

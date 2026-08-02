@@ -10,8 +10,9 @@
     <AssemblyName>KSeFMonitor</AssemblyName>
     <RootNamespace>KsefMonitor</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/KSeFMonitor.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>0.1.0</Version>
+    <Version>0.4.6</Version>
     <Authors>KSeF Monitor</Authors>
   </PropertyGroup>
 
@@ -23,4 +24,8 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Assets/KSeFMonitor.ico" LogicalName="KsefMonitor.Assets.KSeFMonitor.ico" />
+  </ItemGroup>
 </Project>

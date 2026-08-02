@@ -16,12 +16,17 @@ namespace KsefMonitor;
 
 internal sealed class KsefApiClient : IDisposable
 {
+    // API dopuszcza maksymalnie trzy miesiące. Dwumiesięczne okna zostawiają
+    // bezpieczny margines na zmianę czasu i różne offsety strefy Warszawy.
+    private const int MetadataQueryWindowMonths = 2;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
     private readonly HttpClient _http;
+    private readonly HttpMessageHandler _handler;
     private readonly SemaphoreSlim _authGate = new(1, 1);
     private readonly string _nip;
     private string _ksefToken;
@@ -32,10 +37,11 @@ internal sealed class KsefApiClient : IDisposable
     {
         _nip = NipValidator.Normalize(settings.Nip);
         _ksefToken = ksefToken.Trim();
-        _http = handler is null ? new HttpClient() : new HttpClient(handler, disposeHandler: true);
-        _http.BaseAddress = settings.GetBaseUri();
+        _handler = handler ?? CreateDefaultHandler();
+        _http = new HttpClient(_handler, disposeHandler: false);
+        _http.BaseAddress = AppSettings.GetBaseUri();
         _http.Timeout = TimeSpan.FromSeconds(60);
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.1 (Windows 11)");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.4.6 (Windows 11)");
         _http.DefaultRequestHeaders.Add("X-Error-Format", "problem-details");
     }
 
@@ -58,22 +64,44 @@ internal sealed class KsefApiClient : IDisposable
     {
         var collected = new Dictionary<string, InvoiceMetadata>(StringComparer.Ordinal);
         DateTimeOffset? hwm = null;
+        var windowFrom = from;
+
+        for (var windowGuard = 0; windowGuard < 100; windowGuard++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var maximumWindowEnd = windowFrom.AddMonths(MetadataQueryWindowMonths);
+            var windowTo = maximumWindowEnd < DateTimeOffset.UtcNow ? maximumWindowEnd : (DateTimeOffset?)null;
+            var window = await QueryReceivedInvoicesWindowAsync(windowFrom, windowTo, cancellationToken).ConfigureAwait(false);
+
+            foreach (var invoice in window.Invoices)
+                collected[invoice.KsefNumber] = invoice;
+            if (window.PermanentStorageHwmDate is { } windowHwm) hwm = windowHwm;
+
+            if (windowTo is null)
+                return new MetadataQueryResult(collected.Values.OrderBy(x => x.PermanentStorageDate).ToList(), hwm);
+
+            // Okna są przylegające. Rekord na granicy może wrócić ponownie,
+            // dlatego wynik jest deduplikowany powyżej po numerze KSeF.
+            windowFrom = windowTo.Value;
+        }
+
+        throw new KsefApiException("Przekroczono bezpieczny limit okien czasowych odpowiedzi KSeF.");
+    }
+
+    private async Task<MetadataQueryResult> QueryReceivedInvoicesWindowAsync(
+        DateTimeOffset from,
+        DateTimeOffset? to,
+        CancellationToken cancellationToken)
+    {
+        var collected = new Dictionary<string, InvoiceMetadata>(StringComparer.Ordinal);
+        DateTimeOffset? hwm = null;
         var pageOffset = 0;
         var rangeFrom = from;
-        var guard = 0;
+        var completed = false;
 
-        while (guard++ < 200)
+        for (var guard = 0; guard < 200; guard++)
         {
-            var body = new
-            {
-                subjectType = "Subject2",
-                dateRange = new
-                {
-                    dateType = "PermanentStorage",
-                    from = rangeFrom.ToString("O", CultureInfo.InvariantCulture),
-                    restrictToPermanentStorageHwmDate = true
-                }
-            };
+            var body = CreateReceivedInvoiceQuery(rangeFrom, to);
 
             using var response = await SendAuthorizedAsync(
                 HttpMethod.Post,
@@ -83,23 +111,26 @@ internal sealed class KsefApiClient : IDisposable
 
             using var document = await ParseJsonAsync(response, cancellationToken).ConfigureAwait(false);
             var root = document.RootElement;
+            ValidateMetadataResponse(root);
             if (TryGetDateTimeOffset(root, "permanentStorageHwmDate", out var responseHwm)) hwm = responseHwm;
 
             var page = new List<InvoiceMetadata>();
-            if (root.TryGetProperty("invoices", out var invoices) && invoices.ValueKind == JsonValueKind.Array)
+            var invoices = root.GetProperty("invoices");
+            foreach (var invoice in invoices.EnumerateArray())
             {
-                foreach (var invoice in invoices.EnumerateArray())
-                {
-                    var parsed = ParseMetadata(invoice);
-                    if (string.IsNullOrWhiteSpace(parsed.KsefNumber)) continue;
-                    collected[parsed.KsefNumber] = parsed;
-                    page.Add(parsed);
-                }
+                var parsed = ParseMetadata(invoice);
+                if (string.IsNullOrWhiteSpace(parsed.KsefNumber)) continue;
+                collected[parsed.KsefNumber] = parsed;
+                page.Add(parsed);
             }
 
-            var hasMore = GetBoolean(root, "hasMore");
-            var truncated = GetBoolean(root, "isTruncated");
-            if (!hasMore) break;
+            var hasMore = root.GetProperty("hasMore").GetBoolean();
+            var truncated = root.GetProperty("isTruncated").GetBoolean();
+            if (!hasMore)
+            {
+                completed = true;
+                break;
+            }
 
             if (truncated)
             {
@@ -115,8 +146,23 @@ internal sealed class KsefApiClient : IDisposable
             }
         }
 
-        if (guard >= 200) throw new KsefApiException("Przekroczono bezpieczny limit stron odpowiedzi KSeF.");
+        if (!completed) throw new KsefApiException("Przekroczono bezpieczny limit stron odpowiedzi KSeF.");
         return new MetadataQueryResult(collected.Values.OrderBy(x => x.PermanentStorageDate).ToList(), hwm);
+    }
+
+    public async Task VerifyInvoiceReadAccessAsync(CancellationToken cancellationToken)
+    {
+        // To jest wyłącznie test uprawnienia InvoiceRead, nie punkt synchronizacji.
+        // Wyłączenie ograniczenia HWM zapobiega fałszywemu błędowi 21183, gdy
+        // bieżący HWM serwera jest opóźniony o więcej niż pięć minut.
+        var body = CreateReceivedInvoiceQuery(DateTimeOffset.UtcNow.AddMinutes(-5), null, restrictToHwm: false);
+        using var response = await SendAuthorizedAsync(
+            HttpMethod.Post,
+            "invoices/query/metadata?sortOrder=Asc&pageOffset=0&pageSize=10",
+            body,
+            cancellationToken).ConfigureAwait(false);
+        using var document = await ParseJsonAsync(response, cancellationToken).ConfigureAwait(false);
+        ValidateMetadataResponse(document.RootElement);
     }
 
     public async Task<string> DownloadInvoiceXmlAsync(string ksefNumber, CancellationToken cancellationToken)
@@ -307,47 +353,177 @@ internal sealed class KsefApiClient : IDisposable
         return request;
     }
 
+    private static SocketsHttpHandler CreateDefaultHandler() => new()
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        ConnectTimeout = TimeSpan.FromSeconds(15),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(10)
+    };
+
+    private static object CreateReceivedInvoiceQuery(
+        DateTimeOffset from,
+        DateTimeOffset? to,
+        bool restrictToHwm = true)
+    {
+        if (to is { } rangeTo)
+        {
+            return new
+            {
+                subjectType = "Subject2",
+                dateRange = new
+                {
+                    dateType = "PermanentStorage",
+                    from = from.ToString("O", CultureInfo.InvariantCulture),
+                    to = rangeTo.ToString("O", CultureInfo.InvariantCulture),
+                    restrictToPermanentStorageHwmDate = restrictToHwm
+                }
+            };
+        }
+
+        return new
+        {
+            subjectType = "Subject2",
+            dateRange = new
+            {
+                dateType = "PermanentStorage",
+                from = from.ToString("O", CultureInfo.InvariantCulture),
+                restrictToPermanentStorageHwmDate = restrictToHwm
+            }
+        };
+    }
+
+    private static void ValidateMetadataResponse(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object ||
+            !root.TryGetProperty("hasMore", out var hasMore) || hasMore.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
+            !root.TryGetProperty("isTruncated", out var isTruncated) || isTruncated.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
+            !root.TryGetProperty("invoices", out var invoices) || invoices.ValueKind != JsonValueKind.Array)
+            throw new KsefApiException("KSeF zwrócił niepełną odpowiedź z listą metadanych faktur.");
+    }
+
     private static async Task EnsureSuccessAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         if (response.IsSuccessStatusCode) return;
+        var statusCode = response.StatusCode;
+        var retryAfter = GetRetryAfter(response.Headers.RetryAfter);
         var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-        var message = TryGetProblemMessage(body);
-        if (response.StatusCode == HttpStatusCode.TooManyRequests && response.Headers.RetryAfter is { } retryAfter)
-            message += $" Spróbuj ponownie po: {retryAfter}.";
+        var problem = ParseProblem(body);
+        var message = problem.Message;
+        if (statusCode == HttpStatusCode.TooManyRequests && retryAfter is { } delay)
+            message += $" Ponowienie będzie możliwe za około {Math.Ceiling(delay.TotalSeconds):0} s.";
         response.Dispose();
-        throw new KsefApiException($"KSeF HTTP {(int)response.StatusCode}: {message}", response.StatusCode);
+        throw new KsefApiException(
+            $"KSeF HTTP {(int)statusCode}: {message}",
+            statusCode,
+            retryAfter: retryAfter,
+            errorCodes: problem.ErrorCodes);
     }
 
-    private static string TryGetProblemMessage(string body)
+    private static TimeSpan? GetRetryAfter(RetryConditionHeaderValue? value)
     {
-        if (string.IsNullOrWhiteSpace(body)) return "Brak treści odpowiedzi.";
+        if (value?.Delta is { } delta) return delta < TimeSpan.Zero ? TimeSpan.Zero : delta;
+        if (value?.Date is not { } date) return null;
+        var delay = date - DateTimeOffset.UtcNow;
+        return delay < TimeSpan.Zero ? TimeSpan.Zero : delay;
+    }
+
+    private static ParsedProblem ParseProblem(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body)) return new ParsedProblem("Brak treści odpowiedzi.", Array.Empty<int>());
         try
         {
             using var json = JsonDocument.Parse(body);
             var root = json.RootElement;
+
+            if (root.ValueKind == JsonValueKind.Object &&
+                root.TryGetProperty("errors", out var errors) &&
+                errors.ValueKind == JsonValueKind.Array)
+            {
+                var parsed = ParseErrorList(errors, "code", "description");
+                if (parsed.Messages.Count > 0)
+                    return new ParsedProblem(LimitProblemText(string.Join(" | ", parsed.Messages)), parsed.Codes);
+            }
+
+            if (root.ValueKind == JsonValueKind.Object &&
+                root.TryGetProperty("exception", out var exception) &&
+                exception.ValueKind == JsonValueKind.Object &&
+                exception.TryGetProperty("exceptionDetailList", out var legacyErrors) &&
+                legacyErrors.ValueKind == JsonValueKind.Array)
+            {
+                var parsed = ParseErrorList(legacyErrors, "exceptionCode", "exceptionDescription");
+                if (parsed.Messages.Count > 0)
+                    return new ParsedProblem(LimitProblemText(string.Join(" | ", parsed.Messages)), parsed.Codes);
+            }
+
             foreach (var name in new[] { "detail", "title", "message" })
             {
                 var text = GetString(root, name);
-                if (!string.IsNullOrWhiteSpace(text)) return text;
-            }
-
-            if (root.TryGetProperty("exception", out var exception))
-            {
-                var description = GetString(exception, "exceptionDescription");
-                if (!string.IsNullOrWhiteSpace(description)) return description;
+                if (!string.IsNullOrWhiteSpace(text))
+                    return new ParsedProblem(LimitProblemText(text), Array.Empty<int>());
             }
         }
         catch (JsonException)
         {
             // Odpowiedź nie była JSON-em. Zwracamy bezpiecznie skrócony tekst.
         }
-        return body.Length <= 500 ? body : body[..500];
+        return new ParsedProblem(LimitProblemText(body), Array.Empty<int>());
+    }
+
+    private static ParsedErrorList ParseErrorList(JsonElement errors, string codeProperty, string descriptionProperty)
+    {
+        var messages = new List<string>();
+        var codes = new List<int>();
+        foreach (var error in errors.EnumerateArray())
+        {
+            if (error.ValueKind != JsonValueKind.Object) continue;
+            var hasCode = TryGetErrorCode(error, codeProperty, out var code);
+            if (hasCode && !codes.Contains(code)) codes.Add(code);
+
+            var description = GetString(error, descriptionProperty).Trim();
+            var details = new List<string>();
+            if (error.TryGetProperty("details", out var detailList) && detailList.ValueKind == JsonValueKind.Array)
+                foreach (var detail in detailList.EnumerateArray())
+                {
+                    var text = detail.ValueKind == JsonValueKind.String ? detail.GetString() : detail.ToString();
+                    if (!string.IsNullOrWhiteSpace(text)) details.Add(text.Trim());
+                }
+
+            var parts = new List<string>();
+            if (hasCode) parts.Add($"błąd {code}");
+            if (!string.IsNullOrWhiteSpace(description)) parts.Add(description.TrimEnd('.'));
+            parts.AddRange(details.Select(x => x.TrimEnd('.')));
+            if (parts.Count > 0) messages.Add(string.Join(": ", parts) + ".");
+        }
+        return new ParsedErrorList(messages, codes);
+    }
+
+    private static bool TryGetErrorCode(JsonElement error, string propertyName, out int code)
+    {
+        code = default;
+        if (!error.TryGetProperty(propertyName, out var property)) return false;
+        if (property.ValueKind == JsonValueKind.Number) return property.TryGetInt32(out code);
+        return property.ValueKind == JsonValueKind.String &&
+               int.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out code);
+    }
+
+    private static string LimitProblemText(string text)
+    {
+        const int maximumLength = 1_500;
+        var normalized = text.Trim();
+        return normalized.Length <= maximumLength ? normalized : normalized[..maximumLength] + "…";
     }
 
     private static async Task<JsonDocument> ParseJsonAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
-        var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            return await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+        }
+        catch (JsonException exception)
+        {
+            throw new KsefApiException("KSeF zwrócił odpowiedź w niepoprawnym formacie JSON.", exception);
+        }
     }
 
     private static InvoiceMetadata ParseMetadata(JsonElement element)
@@ -433,16 +609,49 @@ internal sealed class KsefApiClient : IDisposable
         _ksefToken = string.Empty;
         _authGate.Dispose();
         _http.Dispose();
+        _handler.Dispose();
     }
 
     private sealed record TokenInfo(string Token, DateTimeOffset ValidUntil);
     private sealed record EncryptionCertificate(byte[] CertificateDer, string PublicKeyId);
+    private sealed record ParsedProblem(string Message, IReadOnlyList<int> ErrorCodes);
+    private sealed record ParsedErrorList(IReadOnlyList<string> Messages, IReadOnlyList<int> Codes);
 }
 
 internal sealed class KsefApiException : Exception
 {
-    public KsefApiException(string message, HttpStatusCode? statusCode = null, Exception? innerException = null)
-        : base(message, innerException) => StatusCode = statusCode;
+    public KsefApiException()
+    {
+    }
+
+    public KsefApiException(string message)
+        : base(message)
+    {
+    }
+
+    public KsefApiException(string message, Exception innerException)
+        : base(message, innerException)
+    {
+    }
+
+    public KsefApiException(string message, HttpStatusCode? statusCode)
+        : base(message) => StatusCode = statusCode;
+
+    public KsefApiException(
+        string message,
+        HttpStatusCode? statusCode,
+        Exception? innerException = null,
+        TimeSpan? retryAfter = null,
+        IReadOnlyList<int>? errorCodes = null)
+        : base(message, innerException)
+    {
+        StatusCode = statusCode;
+        RetryAfter = retryAfter;
+        ErrorCodes = errorCodes ?? Array.Empty<int>();
+    }
 
     public HttpStatusCode? StatusCode { get; }
+    public TimeSpan? RetryAfter { get; }
+    public IReadOnlyList<int> ErrorCodes { get; } = Array.Empty<int>();
+    public bool HasErrorCode(int code) => ErrorCodes.Contains(code);
 }
