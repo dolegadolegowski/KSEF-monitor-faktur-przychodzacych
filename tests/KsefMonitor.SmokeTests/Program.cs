@@ -45,12 +45,14 @@ TestStateContextIsolation();
 TestStatusBanner();
 TestUserFacingErrors();
 TestApplicationLog();
+TestMyDrStateAndSchedule();
 Require(NipValidator.IsValid("526-587-76-35"), "Walidacja poprawnego NIP-u nie działa.");
 Require(!NipValidator.IsValid("5265877634"), "Walidacja błędnego NIP-u nie działa.");
 Require(!NipValidator.IsValid("0000000000"), "Walidacja zaakceptowała techniczny, niepoprawny NIP.");
 Require(!NipValidator.IsValid("ABC5265877635"), "Walidacja zaakceptowała niedozwolone znaki w NIP-ie.");
 Require(AppSettings.GetBaseUri() == new Uri("https://api.ksef.mf.gov.pl/v2/"), "Aplikacja nie używa produkcyjnego endpointu KSeF.");
 await TestKsefProtocolAsync();
+await TestMyDrProtocolAsync();
 
 Console.WriteLine("KSeFMonitor smoke tests: OK");
 return 0;
@@ -277,6 +279,16 @@ static void TestUserFacingErrors()
     Require(fallback.Contains("dzienniku", StringComparison.OrdinalIgnoreCase) &&
             !fallback.Contains("tajny", StringComparison.OrdinalIgnoreCase),
         "Komunikat ogólny ujawnia treść wyjątku.");
+
+    var myDrLogin = UserFacingErrors.ForMyDrSynchronization(
+        new MyDrApiException("techniczny sekret", HttpStatusCode.Unauthorized, "invalid_client"));
+    Require(myDrLogin.Contains("Client ID", StringComparison.Ordinal) &&
+            !myDrLogin.Contains("techniczny", StringComparison.OrdinalIgnoreCase),
+        "Komunikat logowania MyDR nie jest prosty albo ujawnia szczegóły techniczne.");
+    var myDrMalformed = UserFacingErrors.ForMyDrSynchronization(
+        new MyDrApiException("MyDR nie zwrócił poprawnej kwoty brutto dla jednej z usług."));
+    Require(myDrMalformed.Contains("Ostatnia poprawna kwota", StringComparison.Ordinal),
+        "Komunikat niepełnych danych MyDR nie wyjaśnia zachowania ostatniej poprawnej sumy.");
 }
 
 static void TestApplicationLog()
@@ -288,16 +300,52 @@ static void TestApplicationLog()
         var log = new ApplicationLog(path);
         log.Info("Test", "Pierwszy wpis");
         log.Error("Test", "Operacja nie powiodła się", new InvalidOperationException("pełny szczegół diagnostyczny"));
+        var clientSecret = "TEST_ONLY_NOT_A_REAL_CLIENT_SECRET_" + Guid.NewGuid().ToString("N");
+        var refreshToken = "TEST_ONLY_NOT_A_REAL_REFRESH_TOKEN_" + Guid.NewGuid().ToString("N");
+        var accessToken = "TEST_ONLY_NOT_A_REAL_ACCESS_TOKEN_" + Guid.NewGuid().ToString("N");
+        var ksefToken = "TEST_ONLY_NOT_A_REAL_KSEF_TOKEN_" + Guid.NewGuid().ToString("N");
+        var bearerToken = "TEST_ONLY_NOT_A_REAL_BEARER_" + Guid.NewGuid().ToString("N");
+        var authorizationValue = "Basic TEST_ONLY_NOT_A_REAL_AUTHORIZATION_" + Guid.NewGuid().ToString("N");
+        var authorizationFormValue = "TEST_ONLY_NOT_A_REAL_AUTH_FORM_" + Guid.NewGuid().ToString("N");
+        var githubToken = "gh" + "p_" + new string('G', 36);
+        var jwt = "eyJ" + new string('A', 12) + "." + new string('B', 16) + "." + new string('C', 20);
+        var privateKeyBody = "TEST_ONLY_NOT_A_REAL_PRIVATE_KEY_" + Guid.NewGuid().ToString("N");
+        var privateKey = "-----BEGIN " + "PRIVATE KEY-----\n" + privateKeyBody + "\n-----END " + "PRIVATE KEY-----";
+
+        log.Info("Redakcja JSON", $"{{\"client_secret\":\"{clientSecret}\",\"refresh_token\":\"{refreshToken}\"}}");
+        log.Info("Redakcja formularza", $"access_token={accessToken}&token={ksefToken}");
+        log.Info("Redakcja nagłówka", $"Authorization: {authorizationValue}");
+        log.Info("Redakcja autoryzacji formularza", $"authorization=Bearer {authorizationFormValue}");
+        log.Info("Redakcja Bearer", $"Odpowiedź zawiera Bearer {bearerToken}");
+        log.Info("Redakcja formatów", $"GitHub {githubToken}; JWT {jwt}; {privateKey}");
+        log.Info("Zwykłe słowo", "Ten token wygasł, ale w tym zdaniu nie ma jego wartości.");
+        log.Error("Redakcja wyjątku", "Nie zapisuj sekretu z wyjątku",
+            new InvalidOperationException($"KSeF token: {ksefToken}; refresh_token={refreshToken}"));
         Parallel.For(0, 20, index => log.Info("Równoległy test", $"Wpis {index}"));
         var text = log.ReadRecent();
         Require(text.Contains("[INFO] [Test] Pierwszy wpis", StringComparison.Ordinal), "Dziennik nie zachował wpisu informacyjnego.");
         Require(text.Contains("pełny szczegół diagnostyczny", StringComparison.Ordinal), "Dziennik zgubił techniczny opis wyjątku.");
         Require(Enumerable.Range(0, 20).All(index => text.Contains($"Wpis {index}", StringComparison.Ordinal)),
             "Równoległy zapis skleił lub zgubił wpisy dziennika.");
+        var secretCanaries = new[]
+        {
+            clientSecret, refreshToken, accessToken, ksefToken, bearerToken, authorizationValue, authorizationFormValue,
+            githubToken, jwt, privateKeyBody
+        };
+        Require(secretCanaries.All(secret => !text.Contains(secret, StringComparison.Ordinal)),
+            "Dziennik ujawnił co najmniej jeden testowy sekret.");
+        Require(text.Contains("[REDACTED]", StringComparison.Ordinal) &&
+                text.Contains("[REDACTED GITHUB TOKEN]", StringComparison.Ordinal) &&
+                text.Contains("[REDACTED JWT]", StringComparison.Ordinal) &&
+                text.Contains("[REDACTED PRIVATE KEY]", StringComparison.Ordinal),
+            "Dziennik nie oznaczył wszystkich obsługiwanych rodzajów sekretów.");
+        Require(text.Contains("Ten token wygasł, ale w tym zdaniu nie ma jego wartości.", StringComparison.Ordinal),
+            "Redakcja niepotrzebnie usunęła zwykłe użycie słowa token.");
 
         var rotatingPath = Path.Combine(directory, "rotating.log");
         var rotating = new ApplicationLog(rotatingPath, maximumFileBytes: 256);
-        rotating.Info("Rotacja", new string('A', 170));
+        var rotatedSecret = "TEST_ONLY_NOT_A_REAL_ROTATED_SECRET_" + Guid.NewGuid().ToString("N");
+        rotating.Info("Rotacja", $"client_secret={rotatedSecret} " + new string('A', 170));
         rotating.Info("Rotacja", new string('B', 170));
         Require(File.Exists(Path.Combine(directory, "rotating.previous.log")) && File.Exists(rotatingPath),
             "Dziennik nie ogranicza rozmiaru przez rotację pliku.");
@@ -305,12 +353,171 @@ static void TestApplicationLog()
         Require(rotatedText.Contains(new string('A', 30), StringComparison.Ordinal) &&
                 rotatedText.Contains(new string('B', 30), StringComparison.Ordinal),
             "Podgląd dziennika nie łączy poprzedniego i bieżącego pliku po rotacji.");
+        Require(!rotatedText.Contains(rotatedSecret, StringComparison.Ordinal) &&
+                rotatedText.Contains("client_secret=[REDACTED]", StringComparison.Ordinal),
+            "Sekret pozostał widoczny w poprzednim pliku po rotacji dziennika.");
     }
     finally
     {
         if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
     }
 }
+
+static void TestMyDrStateAndSchedule()
+{
+    Require(MyDrVisitStateClassifier.IsPerformed("Do rozliczenia") &&
+            MyDrVisitStateClassifier.IsPerformed("  oczekuje   na płatność ") &&
+            MyDrVisitStateClassifier.IsPerformed("ZAKONCZONA") &&
+            MyDrVisitStateClassifier.IsPerformed("Zamknięta") &&
+            MyDrVisitStateClassifier.IsPerformed("Archiwalna"),
+        "Klasyfikator MyDR nie rozpoznaje wszystkich obsługiwanych stanów wykonanej wizyty.");
+    Require(!MyDrVisitStateClassifier.IsPerformed("Zaplanowana i opłacona") &&
+            !MyDrVisitStateClassifier.IsPerformed("Anulowana"),
+        "Klasyfikator MyDR uznał niewykonaną wizytę za wykonaną.");
+
+    var connectionId = Guid.NewGuid();
+    var state = new MyDrState
+    {
+        ConnectionId = connectionId,
+        LastCheckLocalDate = new DateOnly(2026, 8, 2),
+        Months = new Dictionary<string, MyDrMonthSummary>(StringComparer.Ordinal)
+        {
+            ["2026-08"] = new MyDrMonthSummary { Year = 2026, Month = 8, GrossAmount = 123.45m }
+        },
+        Visits = new Dictionary<long, MyDrCachedVisit>
+        {
+            [17] = new MyDrCachedVisit { VisitId = 17, VisitDate = new DateOnly(2026, 8, 2), GrossAmount = 123.45m }
+        }
+    };
+    var snapshot = state.Snapshot();
+    state.Months["2026-08"].GrossAmount = 0;
+    Require(snapshot.Months["2026-08"].GrossAmount == 123.45m,
+        "Migawka MyDR współdzieli mutowalne podsumowanie ze stanem aktywnym.");
+    state.BindToConnection(Guid.NewGuid());
+    Require(state.Months.Count == 0 && state.Visits.Count == 0 && state.LastCheckLocalDate is null,
+        "Zmiana konta MyDR nie wyczyściła danych poprzedniego połączenia.");
+
+    var zone = TimeZoneInfo.CreateCustomTimeZone("Test/Warsaw", TimeSpan.FromHours(2), "Test", "Test");
+    var now = DateTimeOffset.Parse("2026-08-02T10:00:00Z", CultureInfo.InvariantCulture);
+    Require(MyDrDailySchedule.GetNextCheckUtc(now, new DateOnly(2026, 8, 1), zone) == now,
+        "Niewykonane dzisiejsze sprawdzenie MyDR nie zostało zaplanowane od razu.");
+    Require(MyDrDailySchedule.GetNextCheckUtc(now, new DateOnly(2026, 8, 2), zone) ==
+            DateTimeOffset.Parse("2026-08-02T22:05:00Z", CultureInfo.InvariantCulture),
+        "Kolejne sprawdzenie MyDR nie zostało zaplanowane na następny dzień czasu warszawskiego.");
+
+    var warsaw = MyDrDailySchedule.WarsawTimeZone;
+    Require(MyDrDailySchedule.GetNextCheckUtc(
+                DateTimeOffset.Parse("2026-01-15T12:00:00Z", CultureInfo.InvariantCulture),
+                new DateOnly(2026, 1, 15),
+                warsaw) == DateTimeOffset.Parse("2026-01-15T23:05:00Z", CultureInfo.InvariantCulture),
+        "Zimowy harmonogram MyDR nie uwzględnia czasu CET w Warszawie.");
+    Require(MyDrDailySchedule.GetNextCheckUtc(
+                DateTimeOffset.Parse("2026-07-15T12:00:00Z", CultureInfo.InvariantCulture),
+                new DateOnly(2026, 7, 15),
+                warsaw) == DateTimeOffset.Parse("2026-07-15T22:05:00Z", CultureInfo.InvariantCulture),
+        "Letni harmonogram MyDR nie uwzględnia czasu CEST w Warszawie.");
+}
+
+static async Task TestMyDrProtocolAsync()
+{
+    var clientId = "TEST_ONLY_CLIENT_" + Guid.NewGuid().ToString("N");
+    var clientSecret = "TEST_ONLY_SECRET_" + Guid.NewGuid().ToString("N");
+    var refreshToken = "TEST_ONLY_REFRESH_" + Guid.NewGuid().ToString("N");
+    var rotatedRefreshToken = "TEST_ONLY_ROTATED_" + Guid.NewGuid().ToString("N");
+    var accessToken = "TEST_ONLY_ACCESS_" + Guid.NewGuid().ToString("N");
+    var tokenRequestSeen = false;
+    var requestedPages = new List<int>();
+    var servicesRequestSeen = false;
+    string? immediatelyPersistedRefreshToken = null;
+
+    using var handler = new DelegateHandler(async (message, cancellationToken) =>
+    {
+        Require(message.RequestUri?.Host == "edm.mydr.pl", "Klient MyDR nie używa produkcyjnego hosta.");
+        var path = message.RequestUri?.AbsolutePath ?? string.Empty;
+        if (path.EndsWith("/o/token/", StringComparison.Ordinal))
+        {
+            tokenRequestSeen = true;
+            Require(message.Method == HttpMethod.Post, "OAuth MyDR nie używa POST.");
+            var form = ParseForm(await message.Content!.ReadAsStringAsync(cancellationToken));
+            Require(form.Count == 4 &&
+                    form["grant_type"] == "refresh_token" &&
+                    form["client_id"] == clientId &&
+                    form["client_secret"] == clientSecret &&
+                    form["refresh_token"] == refreshToken,
+                "Żądanie OAuth MyDR nie zawiera dokładnie wymaganych danych.");
+            return Json(HttpStatusCode.OK,
+                $$"""{"expires_in":36000,"access_token":"{{accessToken}}","token_type":"Bearer","scope":"profile external_api","refresh_token":"{{rotatedRefreshToken}}","requires_2fa":false}""");
+        }
+
+        Require(message.Headers.Authorization?.Scheme == "Bearer" &&
+                message.Headers.Authorization.Parameter == accessToken,
+            "Zapytanie MyDR nie używa uzyskanego Bearer tokena.");
+        if (path.EndsWith("/visits/", StringComparison.Ordinal))
+        {
+            var query = ParseForm((message.RequestUri?.Query ?? string.Empty).TrimStart('?'));
+            Require(query["visit_kind"] == "Prywatna" && query["date_from"] == "2026-08-01" &&
+                    query["date_to"] == "2026-08-31" && query["page_size"] == "100",
+                "Lista wizyt MyDR nie używa poprawnego rodzaju lub zakresu dat.");
+            var page = int.Parse(query["page"], CultureInfo.InvariantCulture);
+            requestedPages.Add(page);
+            return page == 1
+                ? Json(HttpStatusCode.OK, """{"current_page":1,"last_page":2,"count":2,"next":"https://niezaufany.example/strona/2","results":[{"id":11,"date":"2026-08-02","state":"Do rozliczenia","visit_kind":"Prywatna","latest_modification":"2026-08-02T12:00:00"}]}""")
+                : Json(HttpStatusCode.OK, """{"current_page":2,"last_page":2,"count":2,"next":null,"results":[{"id":12,"date":"2026-08-03","state":"Zaplanowana","visit_kind":"Prywatna","latest_modification":"2026-08-02T13:00:00"}]}""");
+        }
+
+        if (path.EndsWith("/visits/11/services/", StringComparison.Ordinal))
+        {
+            servicesRequestSeen = true;
+            return Json(HttpStatusCode.OK,
+                """[{"id":101,"quantity":2,"base_price":"100.00","discount":"10.00","value":"190.00"},{"id":102,"quantity":1,"base_price":"50.00","discount":"0.00","value":"50.00"}]""");
+        }
+
+        return Json(HttpStatusCode.NotFound, """{"detail":"Nieobsłużona ścieżka testowa"}""");
+    });
+
+    var credentials = new MyDrCredentials
+    {
+        ClientId = clientId,
+        ClientSecret = clientSecret,
+        RefreshToken = refreshToken
+    };
+    using var client = new MyDrApiClient(
+        credentials,
+        handler,
+        rotated => immediatelyPersistedRefreshToken = rotated);
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    var token = await client.AuthenticateAsync(timeout.Token);
+    Require(tokenRequestSeen && token.RotatedRefreshToken == rotatedRefreshToken &&
+            immediatelyPersistedRefreshToken == rotatedRefreshToken &&
+            client.TakeRotatedRefreshToken() == rotatedRefreshToken && client.TakeRotatedRefreshToken() is null,
+        "Klient MyDR nie przekazał rotacji Refresh Tokena do natychmiastowego zapisu.");
+    var visits = await client.GetPrivateVisitsAsync(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 31), timeout.Token);
+    Require(requestedPages.SequenceEqual([1, 2]) && visits.Select(visit => visit.Id).SequenceEqual([11L, 12L]),
+        "Klient MyDR nie obsłużył bezpiecznie paginacji lub filtra wizyt prywatnych.");
+    var services = await client.GetVisitServicesAsync(11, timeout.Token);
+    Require(servicesRequestSeen && services.Sum(MyDrApiClient.GetServiceGrossValue) == 240m,
+        "Klient MyDR nie obliczył sumy pola value usług.");
+
+    var malformed = new MyDrAttachedPrivateService { Id = 1, Value = "wartość-nieprawidłowa" };
+    try
+    {
+        _ = MyDrApiClient.GetServiceGrossValue(malformed);
+        throw new InvalidOperationException("Klient MyDR zaakceptował niepoprawną kwotę.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(!exception.Message.Contains(malformed.Value, StringComparison.Ordinal),
+            "Wyjątek parsera MyDR ujawnił surową wartość odpowiedzi.");
+    }
+}
+
+static Dictionary<string, string> ParseForm(string value) => value
+    .Split('&', StringSplitOptions.RemoveEmptyEntries)
+    .Select(part => part.Split('=', 2))
+    .ToDictionary(
+        part => Uri.UnescapeDataString(part[0].Replace('+', ' ')),
+        part => Uri.UnescapeDataString((part.Length > 1 ? part[1] : string.Empty).Replace('+', ' ')),
+        StringComparer.Ordinal);
 
 static async Task TestKsefProtocolAsync()
 {

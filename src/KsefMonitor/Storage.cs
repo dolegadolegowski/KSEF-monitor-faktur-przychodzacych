@@ -22,6 +22,8 @@ internal static class AppPaths
     public static string StateFile => Path.Combine(Root, "invoices.dat");
     public static string TokenFile => Path.Combine(Root, "credential.dat");
     public static string DownloadRateFile => Path.Combine(Root, "download-rate.dat");
+    public static string MyDrCredentialsFile => Path.Combine(Root, "mydr-credentials.dat");
+    public static string MyDrStateFile => Path.Combine(Root, "mydr-state.dat");
     public static string LogFile => Path.Combine(Root, "app.log");
 
     public static void EnsureCreated()
@@ -33,6 +35,8 @@ internal static class AppPaths
 [SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Granica odczytu danych musi odzyskać kopię lub uruchomić aplikację z pustym stanem zamiast zakończyć proces.")]
 internal sealed class AppStore
 {
+    private const string MyDrCredentialsProtectionPurpose = "mydr-credentials/v1";
+    private const string MyDrStateProtectionPurpose = "mydr-state/v1";
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -237,6 +241,123 @@ internal sealed class AppStore
         }
     }
 
+    public MyDrCredentials? LoadMyDrCredentials()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                if (!FileOrBackupExists(AppPaths.MyDrCredentialsFile)) return null;
+                var credentials = ReadProtectedWithBackup(
+                    AppPaths.MyDrCredentialsFile,
+                    "danych dostępowych MyDR",
+                    clear => JsonSerializer.Deserialize<MyDrCredentials>(clear, JsonOptions),
+                    MyDrCredentialsProtectionPurpose);
+                credentials?.NormalizeAfterLoad();
+                return credentials;
+            }
+            catch (Exception exception)
+            {
+                RecordLoadWarning("Nie udało się odczytać danych dostępowych MyDR.", exception);
+                return null;
+            }
+        }
+    }
+
+    public void SaveMyDrCredentials(MyDrCredentials credentials)
+    {
+        ArgumentNullException.ThrowIfNull(credentials);
+        credentials.NormalizeAfterLoad();
+        if (!credentials.IsConfigured)
+            throw new ArgumentException("Dane dostępowe MyDR są niekompletne.", nameof(credentials));
+
+        lock (_gate)
+        {
+            var clear = JsonSerializer.SerializeToUtf8Bytes(credentials.Snapshot(), JsonOptions);
+            try
+            {
+                AtomicWrite(
+                    AppPaths.MyDrCredentialsFile,
+                    WindowsDataProtection.Protect(clear, MyDrCredentialsProtectionPurpose));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
+        }
+    }
+
+    public bool TryReplaceMyDrCredentials(Guid expectedConnectionId, MyDrCredentials credentials)
+    {
+        ArgumentNullException.ThrowIfNull(credentials);
+        lock (_gate)
+        {
+            var current = LoadMyDrCredentials();
+            if (current is null || current.ConnectionId != expectedConnectionId) return false;
+            SaveMyDrCredentials(credentials);
+            return true;
+        }
+    }
+
+    public void DeleteMyDrCredentials()
+    {
+        lock (_gate)
+        {
+            DeleteFileAndRecoveryCopies(AppPaths.MyDrCredentialsFile);
+        }
+    }
+
+    public MyDrState LoadMyDrState()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                if (!FileOrBackupExists(AppPaths.MyDrStateFile)) return new MyDrState();
+                var state = ReadProtectedWithBackup(
+                                AppPaths.MyDrStateFile,
+                                "lokalnego podsumowania MyDR",
+                                clear => JsonSerializer.Deserialize<MyDrState>(clear, JsonOptions),
+                                MyDrStateProtectionPurpose)
+                            ?? new MyDrState();
+                state.NormalizeAfterLoad();
+                return state;
+            }
+            catch (Exception exception)
+            {
+                RecordLoadWarning("Nie udało się odczytać lokalnego podsumowania MyDR.", exception);
+                return new MyDrState();
+            }
+        }
+    }
+
+    public void SaveMyDrState(MyDrState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        var snapshot = state.Snapshot();
+        lock (_gate)
+        {
+            var clear = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
+            try
+            {
+                AtomicWrite(
+                    AppPaths.MyDrStateFile,
+                    WindowsDataProtection.Protect(clear, MyDrStateProtectionPurpose));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
+        }
+    }
+
+    private static void DeleteFileAndRecoveryCopies(string path)
+    {
+        if (File.Exists(path)) File.Delete(path);
+        if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+        if (File.Exists(path + ".tmp")) File.Delete(path + ".tmp");
+    }
+
     private static void AtomicWrite(string path, byte[] bytes)
     {
         var temp = path + ".tmp";
@@ -297,11 +418,15 @@ internal sealed class AppStore
         }
     }
 
-    private T? ReadProtectedWithBackup<T>(string path, string description, Func<byte[], T?> deserialize)
+    private T? ReadProtectedWithBackup<T>(
+        string path,
+        string description,
+        Func<byte[], T?> deserialize,
+        string? protectionPurpose = null)
     {
         try
         {
-            return ReadProtected(path, deserialize);
+            return ReadProtected(path, deserialize, protectionPurpose);
         }
         catch (Exception primaryException)
         {
@@ -309,7 +434,7 @@ internal sealed class AppStore
             if (!File.Exists(backup)) throw;
             try
             {
-                var value = ReadProtected(backup, deserialize);
+                var value = ReadProtected(backup, deserialize, protectionPurpose);
                 File.Copy(backup, path, overwrite: true);
                 RecordLoadWarning($"Odzyskano {description} z kopii zapasowej.", primaryException);
                 return value;
@@ -321,9 +446,12 @@ internal sealed class AppStore
         }
     }
 
-    private static T? ReadProtected<T>(string path, Func<byte[], T?> deserialize)
+    private static T? ReadProtected<T>(string path, Func<byte[], T?> deserialize, string? protectionPurpose)
     {
-        var clear = WindowsDataProtection.Unprotect(File.ReadAllBytes(path));
+        var encrypted = File.ReadAllBytes(path);
+        var clear = protectionPurpose is null
+            ? WindowsDataProtection.Unprotect(encrypted)
+            : WindowsDataProtection.Unprotect(encrypted, protectionPurpose);
         try
         {
             var value = deserialize(clear);
@@ -351,16 +479,22 @@ internal static class WindowsDataProtection
     private const int CryptProtectUiForbidden = 0x1;
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("KSeFMonitor/v1/current-user");
 
-    public static byte[] Protect(byte[] clear) => Transform(clear, protect: true);
-    public static byte[] Unprotect(byte[] encrypted) => Transform(encrypted, protect: false);
+    public static byte[] Protect(byte[] clear) => Transform(clear, protect: true, Entropy);
+    public static byte[] Unprotect(byte[] encrypted) => Transform(encrypted, protect: false, Entropy);
 
-    private static byte[] Transform(byte[] input, bool protect)
+    public static byte[] Protect(byte[] clear, string purpose) =>
+        Transform(clear, protect: true, CreatePurposeEntropy(purpose));
+
+    public static byte[] Unprotect(byte[] encrypted, string purpose) =>
+        Transform(encrypted, protect: false, CreatePurposeEntropy(purpose));
+
+    private static byte[] Transform(byte[] input, bool protect, byte[] entropy)
     {
         if (!OperatingSystem.IsWindows())
             throw new PlatformNotSupportedException("Magazyn danych KSeF wymaga mechanizmu DPAPI systemu Windows.");
 
         using var inputBlob = DataBlob.FromBytes(input);
-        using var entropyBlob = DataBlob.FromBytes(Entropy);
+        using var entropyBlob = DataBlob.FromBytes(entropy);
         NativeBlob outputBlob = default;
 
         var success = protect
@@ -381,6 +515,13 @@ internal static class WindowsDataProtection
         {
             if (outputBlob.pbData != IntPtr.Zero) LocalFree(outputBlob.pbData);
         }
+    }
+
+    private static byte[] CreatePurposeEntropy(string purpose)
+    {
+        if (string.IsNullOrWhiteSpace(purpose))
+            throw new ArgumentException("Cel ochrony danych nie może być pusty.", nameof(purpose));
+        return Encoding.UTF8.GetBytes($"KSeFMonitor/v1/current-user/{purpose.Trim()}");
     }
 
     [StructLayout(LayoutKind.Sequential)]

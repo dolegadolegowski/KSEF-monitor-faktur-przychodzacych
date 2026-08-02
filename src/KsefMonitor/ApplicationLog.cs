@@ -44,9 +44,10 @@ internal sealed class ApplicationLog
                 if (File.Exists(_previousFilePath)) text.Append(File.ReadAllText(_previousFilePath, Encoding.UTF8));
                 if (File.Exists(_filePath)) text.Append(File.ReadAllText(_filePath, Encoding.UTF8));
                 if (text.Length == 0) return "Dziennik jest pusty.";
-                if (text.Length <= maximumCharacters) return text.ToString();
+                var safeText = SecretRedactor.Redact(text.ToString());
+                if (safeText.Length <= maximumCharacters) return safeText;
                 return "… pokazano ostatnią część dziennika …" + Environment.NewLine +
-                       text.ToString(text.Length - maximumCharacters, maximumCharacters);
+                       safeText[^maximumCharacters..];
             }
             catch
             {
@@ -61,7 +62,9 @@ internal sealed class ApplicationLog
         {
             var safeSource = NormalizeSingleLine(source);
             var safeMessage = NormalizeSingleLine(message);
-            var details = exception is null ? string.Empty : Environment.NewLine + Limit(exception.ToString());
+            var details = exception is null
+                ? string.Empty
+                : Environment.NewLine + Limit(SecretRedactor.Redact(exception.ToString()));
             var entry = $"[{DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture)}] [{level}] [{safeSource}] {safeMessage}{details}{Environment.NewLine}";
             var entryBytes = Encoding.UTF8.GetByteCount(entry);
 
@@ -89,7 +92,7 @@ internal sealed class ApplicationLog
     }
 
     private static string NormalizeSingleLine(string value) =>
-        Limit((value ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim());
+        Limit(SecretRedactor.Redact(value).Replace('\r', ' ').Replace('\n', ' ').Trim());
 
     private static string Limit(string value) =>
         value.Length <= MaximumEntryCharacters ? value : value[..MaximumEntryCharacters] + "…";

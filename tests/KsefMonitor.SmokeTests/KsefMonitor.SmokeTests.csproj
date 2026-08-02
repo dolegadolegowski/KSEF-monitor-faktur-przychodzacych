@@ -10,7 +10,11 @@
     <Compile Include="..\..\src\KsefMonitor\InvoiceXmlReader.cs" Link="InvoiceXmlReader.cs" />
     <Compile Include="..\..\src\KsefMonitor\InvoicePresentation.cs" Link="InvoicePresentation.cs" />
     <Compile Include="..\..\src\KsefMonitor\KsefApiClient.cs" Link="KsefApiClient.cs" />
+    <Compile Include="..\..\src\KsefMonitor\MyDrModels.cs" Link="MyDrModels.cs" />
+    <Compile Include="..\..\src\KsefMonitor\MyDrApiClient.cs" Link="MyDrApiClient.cs" />
+    <Compile Include="..\..\src\KsefMonitor\MyDrState.cs" Link="MyDrState.cs" />
     <Compile Include="..\..\src\KsefMonitor\ApplicationLog.cs" Link="ApplicationLog.cs" />
+    <Compile Include="..\..\src\KsefMonitor\SecretRedactor.cs" Link="SecretRedactor.cs" />
     <Compile Include="..\..\src\KsefMonitor\UserFacingErrors.cs" Link="UserFacingErrors.cs" />
   </ItemGroup>
 </Project>

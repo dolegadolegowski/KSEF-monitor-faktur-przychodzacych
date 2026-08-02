@@ -99,6 +99,51 @@ internal static class UserFacingErrors
         return "Nie udało się sprawdzić połączenia. Szczegóły zapisano w zakładce Dziennik.";
     }
 
+    public static string ForMyDrSynchronization(Exception exception)
+    {
+        exception = Unwrap(exception);
+        if (exception is InvalidOperationException &&
+            exception.Message.Contains("danych dostępowych MyDR", StringComparison.OrdinalIgnoreCase))
+            return "Brakuje danych dostępowych MyDR. Uzupełnij je w ustawieniach.";
+        if (exception is InvalidOperationException &&
+            exception.Message.Contains("już trwa", StringComparison.OrdinalIgnoreCase))
+            return "Odświeżanie MyDR już trwa. Poczekaj na jego zakończenie.";
+
+        if (exception is MyDrApiException api)
+        {
+            if (string.Equals(api.OAuthErrorCode, "invalid_grant", StringComparison.Ordinal))
+                return "MyDR odrzucił Refresh Token. Wprowadź aktualny token w ustawieniach.";
+            if (string.Equals(api.OAuthErrorCode, "invalid_client", StringComparison.Ordinal) ||
+                api.StatusCode == HttpStatusCode.Unauthorized)
+                return "Nie udało się zalogować do MyDR. Sprawdź Client ID i Client Secret w ustawieniach.";
+            if (api.Message.Contains("2FA", StringComparison.OrdinalIgnoreCase) ||
+                api.Message.Contains("external_api", StringComparison.OrdinalIgnoreCase))
+                return "Dostęp do API MyDR nie jest jeszcze aktywny. Poproś administratora MyDR o włączenie dostępu i dokończenie weryfikacji konta.";
+            if (api.StatusCode == HttpStatusCode.Forbidden)
+                return "MyDR nie pozwala odczytać wizyt i usług. Poproś administratora MyDR o sprawdzenie dostępu do API.";
+            if (api.StatusCode == HttpStatusCode.TooManyRequests)
+                return "MyDR chwilowo ograniczył liczbę zapytań. Możesz spróbować ponownie później w ustawieniach.";
+            if (api.StatusCode is { } statusCode && (int)statusCode >= 500)
+                return "MyDR jest chwilowo niedostępny. Aplikacja zachowała ostatnią poprawną kwotę.";
+            if (api.Message.Contains("kwoty brutto", StringComparison.OrdinalIgnoreCase) ||
+                api.Message.Contains("niepoprawną", StringComparison.OrdinalIgnoreCase) ||
+                api.Message.Contains("niepełną", StringComparison.OrdinalIgnoreCase))
+                return "MyDR zwrócił niepełne dane. Ostatnia poprawna kwota pozostała bez zmian.";
+            if (api.Message.Contains("połączyć", StringComparison.OrdinalIgnoreCase))
+                return "Nie można połączyć się z MyDR. Sprawdź połączenie z internetem.";
+        }
+
+        if (IsTimeout(exception))
+            return "MyDR nie odpowiedział na czas. Ostatnia poprawna kwota pozostała bez zmian.";
+        if (exception is HttpRequestException)
+            return "Nie można połączyć się z MyDR. Sprawdź połączenie z internetem.";
+        if (IsLocalStorageError(exception))
+            return "Nie udało się bezpiecznie zapisać danych MyDR na tym komputerze. Sprawdź wolne miejsce na dysku.";
+        if (exception is OverflowException)
+            return "MyDR zwrócił kwotę spoza obsługiwanego zakresu. Ostatnia poprawna kwota pozostała bez zmian.";
+        return "Nie udało się odświeżyć obrotu MyDR. Ostatnia poprawna kwota pozostała bez zmian. Szczegóły są w dzienniku.";
+    }
+
     public static string ForSettingsSave(Exception exception) => IsLocalStorageError(Unwrap(exception))
         ? "Nie udało się zapisać ustawień na tym komputerze. Sprawdź wolne miejsce na dysku."
         : "Nie udało się zapisać ustawień. Spróbuj ponownie.";

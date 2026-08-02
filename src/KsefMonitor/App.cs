@@ -17,6 +17,7 @@ internal sealed class App : System.Windows.Application
     private AppStore? _store;
     private ApplicationLog? _log;
     private SynchronizationService? _synchronization;
+    private MyDrSynchronizationService? _myDrSynchronization;
     private MainWindow? _mainWindow;
     private Mutex? _singleInstance;
     private EventWaitHandle? _activationEvent;
@@ -63,7 +64,8 @@ internal sealed class App : System.Windows.Application
         _log.Info("Aplikacja", $"Uruchomiono KSeF Monitor v{version?.Major ?? 0}.{version?.Minor ?? 0}.{Math.Max(0, version?.Build ?? 0)} na {Environment.OSVersion}.");
         _store = new AppStore(_log);
         _synchronization = new SynchronizationService(_store);
-        _mainWindow = new MainWindow(_store, _synchronization);
+        _myDrSynchronization = new MyDrSynchronizationService(_store);
+        _mainWindow = new MainWindow(_store, _synchronization, _myDrSynchronization);
         MainWindow = _mainWindow;
         _mainWindow.Show();
         _activationRegistration = ThreadPool.RegisterWaitForSingleObject(
@@ -78,6 +80,7 @@ internal sealed class App : System.Windows.Application
     {
         StopActivationListener();
         _mainWindow?.PrepareForExit();
+        _myDrSynchronization?.Dispose();
         _synchronization?.Dispose();
         _singleInstance?.ReleaseMutex();
         _singleInstance = null;
@@ -87,6 +90,7 @@ internal sealed class App : System.Windows.Application
     protected override void OnExit(ExitEventArgs e)
     {
         StopActivationListener();
+        _myDrSynchronization?.Dispose();
         _synchronization?.Dispose();
         _log?.Info("Aplikacja", "Zakończono działanie aplikacji.");
         base.OnExit(e);

@@ -20,9 +20,11 @@ internal sealed class MainWindow : Window
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(20, 73, 122));
     private readonly AppStore _store;
     private readonly SynchronizationService _synchronization;
+    private readonly MyDrSynchronizationService _myDrSynchronization;
     private readonly DataGrid _grid = new();
     private readonly TextBlock _monthLabel = new();
-    private readonly TextBlock _monthSummary = new();
+    private readonly TextBlock _ksefMonthSummary = new();
+    private readonly TextBlock _myDrMonthSummary = new();
     private readonly TextBlock _status = new();
     private readonly Button _previousMonth = new();
     private readonly Button _nextMonth = new();
@@ -33,15 +35,19 @@ internal sealed class MainWindow : Window
     private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
     private readonly StatusBannerState _statusBanner = new(TimeSpan.FromSeconds(30));
     private readonly Dictionary<string, InvoiceDetailsWindow> _detailsWindows = new(StringComparer.Ordinal);
-    private DateTime _displayMonth = new(DateTime.Today.Year, DateTime.Today.Month, 1);
+    private DateTime _displayMonth = GetCurrentWarsawMonth();
     private bool _reallyClose;
     private bool _minimizeHintShown;
     private string? _notificationTarget;
 
-    public MainWindow(AppStore store, SynchronizationService synchronization)
+    public MainWindow(
+        AppStore store,
+        SynchronizationService synchronization,
+        MyDrSynchronizationService myDrSynchronization)
     {
         _store = store;
         _synchronization = synchronization;
+        _myDrSynchronization = myDrSynchronization;
         Title = "KSeF Monitor — Faktury otrzymane";
         Width = 1040;
         Height = 680;
@@ -58,6 +64,8 @@ internal sealed class MainWindow : Window
         _synchronization.StatusChanged += OnStatusChanged;
         _synchronization.StateChanged += OnStateChanged;
         _synchronization.NewInvoicesDiscovered += OnNewInvoicesDiscovered;
+        _myDrSynchronization.StatusChanged += OnStatusChanged;
+        _myDrSynchronization.StateChanged += OnMyDrStateChanged;
 
         Loaded += OnLoaded;
         Closing += OnClosing;
@@ -116,15 +124,19 @@ internal sealed class MainWindow : Window
         monthButtons.Children.Add(_nextMonth);
         headerGrid.Children.Add(monthButtons);
 
-        _monthSummary.HorizontalAlignment = HorizontalAlignment.Stretch;
-        _monthSummary.TextAlignment = TextAlignment.Center;
-        _monthSummary.VerticalAlignment = VerticalAlignment.Center;
-        _monthSummary.Margin = new Thickness(18, 0, 18, 0);
-        _monthSummary.Foreground = new SolidColorBrush(Color.FromRgb(70, 81, 94));
-        _monthSummary.FontSize = 12.5;
-        _monthSummary.TextTrimming = TextTrimming.CharacterEllipsis;
-        Grid.SetColumn(_monthSummary, 1);
-        headerGrid.Children.Add(_monthSummary);
+        var summaries = new StackPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(18, 0, 18, 0)
+        };
+        ConfigureSummaryText(_ksefMonthSummary);
+        ConfigureSummaryText(_myDrMonthSummary);
+        _myDrMonthSummary.Margin = new Thickness(0, 3, 0, 0);
+        summaries.Children.Add(_ksefMonthSummary);
+        summaries.Children.Add(_myDrMonthSummary);
+        Grid.SetColumn(summaries, 1);
+        headerGrid.Children.Add(summaries);
 
         var actions = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
         _refreshButton.Content = "--:--";
@@ -278,6 +290,7 @@ internal sealed class MainWindow : Window
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
         _synchronization.Start();
+        _myDrSynchronization.Start();
         if (_store.ConsumeLoadWarning() is not null)
             ShowStatus(new AppStatusMessage(
                 "Nie udało się wczytać części zapisanych danych. Aplikacja użyła bezpiecznej kopii lub ustawień domyślnych.",
@@ -310,18 +323,20 @@ internal sealed class MainWindow : Window
     private void OpenSettings()
     {
         ShowFromTray();
-        var window = new SettingsWindow(_store) { Owner = this };
+        var window = new SettingsWindow(_store, _myDrSynchronization) { Owner = this };
         window.ShowDialog();
-        if (!window.ConfigurationChanged) return;
-        ShowStatus(new AppStatusMessage("Ustawienia zapisane. Oczekiwanie na synchronizację…"));
-        _synchronization.UpdateConfiguration();
+        if (window.ConfigurationChanged)
+        {
+            ShowStatus(new AppStatusMessage("Ustawienia KSeF zapisane. Oczekiwanie na synchronizację…"));
+            _synchronization.UpdateConfiguration();
+        }
         RefreshRows();
     }
 
     private void ChangeMonth(int offset)
     {
         var candidate = _displayMonth.AddMonths(offset);
-        var current = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+        var current = GetCurrentWarsawMonth();
         var oldest = current.AddMonths(-SynchronizationService.VisibleHistoryMonthsBack);
         if (candidate < oldest || candidate > current) return;
         _displayMonth = candidate;
@@ -330,7 +345,7 @@ internal sealed class MainWindow : Window
 
     private void RefreshRows()
     {
-        var current = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+        var current = GetCurrentWarsawMonth();
         var oldest = current.AddMonths(-SynchronizationService.VisibleHistoryMonthsBack);
         if (_displayMonth < oldest || _displayMonth > current) _displayMonth = current;
 
@@ -353,15 +368,22 @@ internal sealed class MainWindow : Window
         var invoiceCounts = items.Count == 0
             ? "Brak faktur"
             : $"Faktury: {items.Count}  •  Nowe: {items.Count(x => x.Source.IsNew)}";
-        _monthSummary.Inlines.Clear();
-        _monthSummary.Inlines.Add(new Run($"{invoiceCounts}  •  ") { FontSize = 12.5 });
-        _monthSummary.Inlines.Add(new Run(grossTotals)
+        var grossValue = grossTotals.Replace("Łącznie brutto: ", string.Empty, StringComparison.Ordinal);
+        _ksefMonthSummary.Inlines.Clear();
+        _ksefMonthSummary.Inlines.Add(new Run("Faktury kosztowe: ")
+        {
+            FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold
+        });
+        _ksefMonthSummary.Inlines.Add(new Run(grossValue)
         {
             FontSize = _monthLabel.FontSize,
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Color.FromRgb(43, 55, 70))
         });
-        _monthSummary.ToolTip = $"{invoiceCounts}  •  {grossTotals}\nKwoty w różnych walutach są sumowane oddzielnie.";
+        _ksefMonthSummary.Inlines.Add(new Run($"  •  {invoiceCounts}") { FontSize = 12.5 });
+        _ksefMonthSummary.ToolTip = $"{invoiceCounts}  •  {grossTotals}\nKwoty w różnych walutach są sumowane oddzielnie.";
+        RefreshMyDrSummary();
         var allNewCount = snapshot.Count(x => x.IsNew);
         _notifyIcon.Text = allNewCount == 0 ? "KSeF Monitor" : $"KSeF Monitor — nowe: {allNewCount}";
         UpdateSyncLabels();
@@ -461,6 +483,91 @@ internal sealed class MainWindow : Window
         RefreshRows();
     });
 
+    private void OnMyDrStateChanged(object? sender, EventArgs e) =>
+        Dispatcher.InvokeAsync(RefreshMyDrSummary);
+
+    private void RefreshMyDrSummary()
+    {
+        var status = _myDrSynchronization.GetStatusSnapshot();
+        var summary = _myDrSynchronization.GetMonthSummary(_displayMonth.Year, _displayMonth.Month);
+        _myDrMonthSummary.Inlines.Clear();
+        _myDrMonthSummary.Inlines.Add(new Run("Obrót MyDR: ")
+        {
+            FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold
+        });
+
+        if (!status.IsConfigured)
+        {
+            _myDrMonthSummary.Inlines.Add(new Run("skonfiguruj połączenie w ustawieniach") { FontSize = 12.5 });
+            _myDrMonthSummary.ToolTip = "Wprowadź Client ID, Client Secret i Refresh Token w zakładce MyDR.";
+            return;
+        }
+
+        if (summary is null)
+        {
+            if (!string.IsNullOrWhiteSpace(status.LastError))
+            {
+                _myDrMonthSummary.Inlines.Add(new Run("brak danych — ostatnia próba nieudana")
+                {
+                    FontSize = 12.5,
+                    Foreground = Brushes.Firebrick
+                });
+                _myDrMonthSummary.ToolTip = SecretRedactor.Redact(status.LastError) +
+                    "\nUżyj „Odśwież teraz” w ustawieniach, aby spróbować ponownie przed kolejnym dniem.";
+                return;
+            }
+
+            var pending = status.IsSynchronizing ? "trwa obliczanie…" : "oczekuje na pierwsze dzienne sprawdzenie";
+            _myDrMonthSummary.Inlines.Add(new Run(pending) { FontSize = 12.5 });
+            _myDrMonthSummary.ToolTip = status.LastAttemptUtc is { } attempt
+                ? $"Ostatnia próba: {TimeZoneInfo.ConvertTime(attempt, MyDrDailySchedule.WarsawTimeZone):dd.MM.yyyy HH:mm} (czas polski)."
+                : "Dane zostaną pobrane podczas pierwszego dziennego sprawdzenia.";
+            return;
+        }
+
+        _myDrMonthSummary.Inlines.Add(new Run($"{summary.GrossAmount:N2} PLN")
+        {
+            FontSize = _monthLabel.FontSize,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromRgb(43, 55, 70))
+        });
+        _myDrMonthSummary.Inlines.Add(new Run($"  •  wizyty: {summary.VisitCount}  •  usługi: {summary.ServiceCount}")
+        {
+            FontSize = 12.5
+        });
+        if (!string.IsNullOrWhiteSpace(status.LastError))
+            _myDrMonthSummary.Inlines.Add(new Run("  •  ostatnia próba nieudana")
+            {
+                FontSize = 12,
+                Foreground = Brushes.Firebrick
+            });
+
+        var lastSuccess = status.LastSuccessfulSyncUtc is { } success
+            ? TimeZoneInfo.ConvertTime(success, MyDrDailySchedule.WarsawTimeZone)
+                .ToString("dd.MM.yyyy HH:mm", CultureInfo.GetCultureInfo("pl-PL"))
+            : "brak";
+        _myDrMonthSummary.ToolTip =
+            $"Ostatnie poprawne odświeżenie: {lastSuccess}.\n" +
+            "Suma pola value usług prywatnych dla wykonanych wizyt: Do rozliczenia, Oczekuje na płatność, Zakończona, Zamknięta lub Archiwalna. Dane są sprawdzane raz dziennie.";
+    }
+
+    private static void ConfigureSummaryText(TextBlock text)
+    {
+        text.HorizontalAlignment = HorizontalAlignment.Stretch;
+        text.TextAlignment = TextAlignment.Center;
+        text.VerticalAlignment = VerticalAlignment.Center;
+        text.Foreground = new SolidColorBrush(Color.FromRgb(70, 81, 94));
+        text.FontSize = 12.5;
+        text.TextTrimming = TextTrimming.CharacterEllipsis;
+    }
+
+    private static DateTime GetCurrentWarsawMonth()
+    {
+        var today = MyDrDailySchedule.GetWarsawDate(DateTimeOffset.UtcNow);
+        return new DateTime(today.Year, today.Month, 1);
+    }
+
     private void OnNewInvoicesDiscovered(object? sender, IReadOnlyList<StoredInvoice> invoices) => Dispatcher.InvokeAsync(() =>
     {
         var settings = _store.LoadSettings();
@@ -522,6 +629,8 @@ internal sealed class MainWindow : Window
         _synchronization.StatusChanged -= OnStatusChanged;
         _synchronization.StateChanged -= OnStateChanged;
         _synchronization.NewInvoicesDiscovered -= OnNewInvoicesDiscovered;
+        _myDrSynchronization.StatusChanged -= OnStatusChanged;
+        _myDrSynchronization.StateChanged -= OnMyDrStateChanged;
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _trayMenu.Dispose();

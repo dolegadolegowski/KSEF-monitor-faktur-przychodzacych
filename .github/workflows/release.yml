@@ -1,0 +1,69 @@
+name: Wydanie Windows
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Pobierz kod
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Sprawdź zgodność tagu z wersją aplikacji
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Tag wydania musi mieć format vMAJOR.MINOR.PATCH."
+          }
+          $expectedVersion = $env:RELEASE_TAG.Substring(1)
+          $projectVersion = (Select-Xml -Path .\src\KsefMonitor\KsefMonitor.csproj -XPath '/Project/PropertyGroup/Version').Node.InnerText
+          if ($projectVersion -ne $expectedVersion) {
+            throw "Tag $env:RELEASE_TAG nie odpowiada wersji projektu $projectVersion."
+          }
+
+      - name: Skonfiguruj .NET 10
+        uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 10.0.302
+
+      - name: Uruchom testy
+        run: dotnet run --project .\tests\KsefMonitor.SmokeTests\KsefMonitor.SmokeTests.csproj -c Release
+
+      - name: Zbuduj pojedynczy plik EXE
+        run: >-
+          dotnet publish .\src\KsefMonitor\KsefMonitor.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -o .\release
+
+      - name: Utwórz sumę SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash .\release\KSeFMonitor.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  KSeFMonitor.exe" | Set-Content .\release\KSeFMonitor.exe.sha256 -Encoding ascii
+
+      - name: Opublikuj GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$env:RELEASE_TAG"
+          .\release\KSeFMonitor.exe
+          .\release\KSeFMonitor.exe.sha256
+          --repo "${{ github.repository }}"
+          --title "KSeF Monitor $env:RELEASE_TAG"
+          --generate-notes
