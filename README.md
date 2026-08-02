@@ -2,7 +2,7 @@
 
 Desktopowa aplikacja Windows 11 do monitorowania faktur otrzymanych w Krajowym Systemie e-Faktur (KSeF API 2.0) oraz miesięcznego obrotu usług prywatnych z MyDR.
 
-Aktualny etap: działająca wersja `0.5.1`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
+Aktualny etap: działająca wersja `0.5.2`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
 
 ## Zaimplementowane
 
@@ -14,6 +14,7 @@ Aktualny etap: działająca wersja `0.5.1`. Aplikacja łączy się wyłącznie z
 - synchronizacja po `PermanentStorage`, sortowanie rosnące, HWM, paginacja i deduplikacja po numerze KSeF;
 - automatyczne odświeżanie co 15 minut oraz przycisk ręcznego odświeżania z sekundowym odliczaniem;
 - lista bieżącego miesiąca i trzech poprzednich miesięcy;
+- liczbowe sortowanie kwot brutto, również dla korekt ujemnych i wartości z separatorami tysięcy;
 - nagłówek `Faktury kosztowe` z miesięcznym podsumowaniem kwot brutto, oddzielnie dla każdej waluty;
 - nagłówek `Obrót MyDR` dla wybranego miesiąca;
 - osobne połączenie OAuth MyDR używające wyłącznie Client ID, Client Secret i Refresh Tokena;
@@ -25,6 +26,7 @@ Aktualny etap: działająca wersja `0.5.1`. Aplikacja łączy się wyłącznie z
 - wielostronicowy podgląd dokumentu w proporcjach A4 z danymi stron, tabelą pozycji, płatnością i podsumowaniem;
 - okno szczegółów: metadane, pozycje z ilością, jednostką, cenami i wartościami netto/brutto, VAT oraz rabatem, wszystkie pola i surowy XML;
 - odczyt pozycji z FA(3), alternatywnych pól brutto oraz dokumentów PEF/UBL;
+- uzupełnianie brakującego VAT i brutto pozycji z wartości netto oraz stawki, bez nadpisywania kwot zapisanych przez wystawcę; wartości pochodne są oznaczone `*` w podglądzie;
 - minimalizacja do traya z osadzoną, wielorozdzielczą ikoną `KSEF` i powiadomienia o nowych fakturach;
 - szyfrowanie tokenów, danych MyDR i lokalnych cache za pomocą Windows DPAPI (`CurrentUser`), z oddzielnymi celami ochrony;
 - izolacja cache i punktu HWM dla konkretnego NIP-u; zmiana kontekstu bezpiecznie zeruje dane poprzedniej firmy;

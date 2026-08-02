@@ -218,7 +218,14 @@ internal sealed class MainWindow : Window
         var amountStyle = new Style(typeof(TextBlock), rowTextStyle);
         amountStyle.Setters.Add(new Setter(TextBlock.TextAlignmentProperty, TextAlignment.Right));
         amountStyle.Setters.Add(new Setter(TextBlock.FontWeightProperty, FontWeights.SemiBold));
-        _grid.Columns.Add(new DataGridTextColumn { Header = "Kwota brutto", Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.GrossAmount)), Width = 155, ElementStyle = amountStyle });
+        _grid.Columns.Add(new DataGridTextColumn
+        {
+            Header = "Kwota brutto",
+            Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.GrossAmount)),
+            SortMemberPath = nameof(InvoiceRow.GrossAmountSortValue),
+            Width = 155,
+            ElementStyle = amountStyle
+        });
         _grid.PreviewMouseLeftButtonUp += OnGridMouseLeftButtonUp;
         _grid.PreviewKeyDown += OnGridPreviewKeyDown;
         Grid.SetRow(_grid, 1);

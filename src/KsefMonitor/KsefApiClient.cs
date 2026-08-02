@@ -41,7 +41,7 @@ internal sealed class KsefApiClient : IDisposable
         _http = new HttpClient(_handler, disposeHandler: false);
         _http.BaseAddress = AppSettings.GetBaseUri();
         _http.Timeout = TimeSpan.FromSeconds(60);
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.5.1 (Windows 11)");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.5.2 (Windows 11)");
         _http.DefaultRequestHeaders.Add("X-Error-Format", "problem-details");
     }
 

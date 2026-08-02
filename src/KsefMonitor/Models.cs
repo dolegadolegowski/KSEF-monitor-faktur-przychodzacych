@@ -217,7 +217,9 @@ internal sealed record InvoiceLine(
     string NetAmount,
     string GrossAmount,
     string VatAmount,
-    string VatRate);
+    string VatRate,
+    bool IsVatAmountCalculated = false,
+    bool IsGrossAmountCalculated = false);
 
 internal sealed record InvoiceField(string Path, string Value);
 
@@ -230,6 +232,8 @@ internal sealed class InvoiceDocument
 
 internal sealed class InvoiceRow
 {
+    private static readonly CultureInfo PolishCulture = CultureInfo.GetCultureInfo("pl-PL");
+
     public required StoredInvoice Source { get; init; }
     public bool IsNew => Source.IsNew;
     public string NewLabel => Source.IsNew ? "NOWA" : string.Empty;
@@ -238,7 +242,8 @@ internal sealed class InvoiceRow
         : Source.IssueDate.ToString("dd.MM.yyyy", CultureInfo.GetCultureInfo("pl-PL"));
     public string Seller => string.IsNullOrWhiteSpace(Source.SellerName) ? Source.SellerNip : Source.SellerName;
     public string InvoiceNumber => Source.InvoiceNumber;
-    public string GrossAmount => $"{Source.GrossAmount:N2} {Source.Currency}";
+    public decimal GrossAmountSortValue => Source.GrossAmount;
+    public string GrossAmount => $"{Source.GrossAmount.ToString("N2", PolishCulture)} {Source.Currency}";
 }
 
 internal static class NipValidator

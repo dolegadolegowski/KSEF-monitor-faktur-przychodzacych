@@ -354,9 +354,13 @@ internal sealed class InvoiceDetailsWindow : Window
         var footer = new Grid { Margin = new Thickness(0, 14, 0, 0) };
         footer.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         footer.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var hasCalculatedLineAmounts = page.Lines.Any(line =>
+            line.IsVatAmountCalculated || line.IsGrossAmountCalculated);
         footer.Children.Add(new TextBlock
         {
-            Text = "Wizualizacja danych faktury ustrukturyzowanej KSeF",
+            Text = hasCalculatedLineAmounts
+                ? "Wizualizacja KSeF • * kwota pozycji wyliczona na potrzeby podglądu"
+                : "Wizualizacja danych faktury ustrukturyzowanej KSeF",
             FontSize = 8.5,
             Foreground = Muted
         });
@@ -588,8 +592,8 @@ internal sealed class InvoiceDetailsWindow : Window
                 FormatUnitPrice(line, hasNetUnitPrice, hasGrossUnitPrice),
                 InvoiceValueFormatter.Money(line.NetAmount),
                 InvoiceValueFormatter.VatRate(line.VatRate),
-                InvoiceValueFormatter.Money(line.VatAmount),
-                InvoiceValueFormatter.Money(line.GrossAmount)
+                FormatLineMoney(line.VatAmount, line.IsVatAmountCalculated),
+                FormatLineMoney(line.GrossAmount, line.IsGrossAmountCalculated)
             };
 
         for (var index = 0; index < values.Length; index++)
@@ -605,6 +609,9 @@ internal sealed class InvoiceDetailsWindow : Window
                 TextAlignment = index == 1 ? TextAlignment.Left : TextAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Center
             };
+            if (!isHeader && line is not null &&
+                (index == 7 && line.IsVatAmountCalculated || index == 8 && line.IsGrossAmountCalculated))
+                text.ToolTip = "Kwota wyliczona na potrzeby podglądu; podsumowanie pochodzi z danych KSeF.";
             var cell = new Border
             {
                 BorderBrush = isHeader ? new SolidColorBrush(Color.FromRgb(70, 112, 153)) : Rule,
@@ -617,6 +624,12 @@ internal sealed class InvoiceDetailsWindow : Window
             grid.Children.Add(cell);
         }
         return grid;
+    }
+
+    private static string FormatLineMoney(string value, bool isCalculated)
+    {
+        var formatted = InvoiceValueFormatter.Money(value);
+        return isCalculated && formatted != "—" ? $"{formatted}*" : formatted;
     }
 
     private static void AddLineColumns(Grid grid)

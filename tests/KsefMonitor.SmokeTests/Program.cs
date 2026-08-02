@@ -35,11 +35,17 @@ Require(parsed.Lines[0].Quantity == "2", "Nie odczytano ilości pozycji FA(3).")
 Require(parsed.Lines[0].Unit == "szt.", "Nie odczytano jednostki miary pozycji FA(3).");
 Require(parsed.Lines[0].UnitNetPrice == "100.00", "Nie odczytano ceny netto pozycji FA(3).");
 Require(parsed.Lines[0].NetAmount == "200.00", "Nie odczytano wartości netto pozycji FA(3).");
+Require(parsed.Lines[0].VatAmount == "46.00", "Nie wyliczono opcjonalnej kwoty VAT pozycji FA(3).");
+Require(parsed.Lines[0].GrossAmount == "246.00", "Nie wyliczono wartości brutto pozycji FA(3).");
+Require(parsed.Lines[0].IsVatAmountCalculated && parsed.Lines[0].IsGrossAmountCalculated,
+    "Wyliczone kwoty pozycji nie zostały oznaczone jako pochodne.");
 Require(parsed.Fields.Count > 10, "Nie spłaszczono wszystkich pól XML.");
 TestGrossLineVariant();
+TestCalculatedLineAmounts();
 TestPefUblLineVariant();
 TestA4Pagination();
 TestMonthlyInvoiceSummary();
+TestInvoiceAmountSortKey();
 TestInvoiceNewState();
 TestStateContextIsolation();
 TestStatusBanner();
@@ -79,6 +85,82 @@ static void TestGrossLineVariant()
     Require(line.Discount == "3.00", "Nie odczytano rabatu FA(3).");
     Require(line.GrossAmount == "366.00", "Nie odczytano wartości brutto FA(3).");
     Require(line.VatAmount == "68.44", "Nie odczytano kwoty VAT FA(3).");
+    Require(!line.IsGrossAmountCalculated && !line.IsVatAmountCalculated,
+        "Jawne kwoty FA(3) zostały błędnie oznaczone jako wyliczone.");
+}
+
+static void TestCalculatedLineAmounts()
+{
+    var netLine = ParseFaLine("<P_11>54.79</P_11><P_12>23</P_12>");
+    Require(netLine.VatAmount == "12.60" && netLine.GrossAmount == "67.39",
+        "Nie wyliczono VAT i brutto z P_11 oraz P_12 zgodnie z zaokrągleniem do groszy.");
+
+    var grossLine = ParseFaLine("<P_11A>123.00</P_11A><P_12>23</P_12>");
+    Require(grossLine.VatAmount == "23.00" && grossLine.GrossAmount == "123.00",
+        "Nie wyliczono VAT dla wariantu ceny brutto P_11A.");
+
+    var explicitVat = ParseFaLine("<P_11>100.00</P_11><P_11Vat>22.99</P_11Vat><P_12>23</P_12>");
+    Require(explicitVat.VatAmount == "22.99" && explicitVat.GrossAmount == "122.99",
+        "Jawna kwota P_11Vat nie otrzymała pierwszeństwa przed wyliczeniem.");
+    Require(!explicitVat.IsVatAmountCalculated && explicitVat.IsGrossAmountCalculated,
+        "Niepoprawnie oznaczono pochodzenie jawnego VAT lub wyliczonego brutto.");
+
+    var correction = ParseFaLine("<P_11>-54.79</P_11><P_12>23</P_12>");
+    Require(correction.VatAmount == "-12.60" && correction.GrossAmount == "-67.39",
+        "Nie wyliczono poprawnie ujemnej pozycji korekty.");
+
+    foreach (var (net, rate, expectedVat, expectedGross) in new[]
+             {
+                 ("40.65", "23", "9.35", "50.00"),
+                 ("0.50", "23", "0.12", "0.62"),
+                 ("-0.50", "23", "-0.12", "-0.62"),
+                 ("0.10", "5", "0.01", "0.11"),
+                 ("100.00", "8", "8.00", "108.00"),
+                 ("-162.60", "23", "-37.40", "-200.00")
+             })
+    {
+        var line = ParseFaLine($"<P_11>{net}</P_11><P_12>{rate}</P_12>");
+        Require(line.VatAmount == expectedVat && line.GrossAmount == expectedGross,
+            $"Niepoprawne zaokrąglenie dla {net} przy stawce {rate}%.");
+    }
+
+    foreach (var zeroRate in new[] { "0 KR", "0 WDT", "0 EX" })
+    {
+        var line = ParseFaLine($"<P_11>10.00</P_11><P_12>{zeroRate}</P_12>");
+        Require(line.VatAmount == "0.00" && line.GrossAmount == "10.00",
+            $"Nie obsłużono zerowej stawki VAT: {zeroRate}.");
+    }
+
+    foreach (var nonTaxable in new[] { "zw", "oo", "np I", "np II" })
+    {
+        var line = ParseFaLine($"<P_11>10.00</P_11><P_12>{nonTaxable}</P_12>");
+        Require(string.IsNullOrEmpty(line.VatAmount) && line.GrossAmount == "10.00",
+            $"Niepoprawnie przedstawiono pozycję nieopodatkowaną: {nonTaxable}.");
+        Require(!line.IsVatAmountCalculated && line.IsGrossAmountCalculated,
+            $"Niepoprawnie oznaczono pochodzenie kwot pozycji: {nonTaxable}.");
+    }
+
+    var ossLine = ParseFaLine("<P_11>100.00</P_11><P_12_XII>19</P_12_XII>");
+    Require(ossLine.VatAmount == "19.00" && ossLine.GrossAmount == "119.00",
+        "Nie wyliczono wartości dla stawki P_12_XII.");
+
+    var incomplete = ParseFaLine("<P_11>10.00</P_11>");
+    Require(string.IsNullOrEmpty(incomplete.VatAmount) && string.IsNullOrEmpty(incomplete.GrossAmount),
+        "Brakująca stawka została bezpodstawnie zastąpiona wyliczoną kwotą.");
+
+    var invalid = ParseFaLine("<P_11>wartość</P_11><P_12>nieznana</P_12>");
+    Require(string.IsNullOrEmpty(invalid.VatAmount) && string.IsNullOrEmpty(invalid.GrossAmount),
+        "Niepoprawne dane pozycji zostały bezpodstawnie użyte do wyliczenia.");
+
+    var grossWithoutRate = ParseFaLine("<P_11A>2000.00</P_11A>");
+    Require(grossWithoutRate.GrossAmount == "2000.00" && string.IsNullOrEmpty(grossWithoutRate.VatAmount),
+        "Jawna wartość P_11A bez stawki nie została zachowana.");
+}
+
+static InvoiceLine ParseFaLine(string fields)
+{
+    var xml = $"<Faktura><Fa><FaWiersz><NrWierszaFa>1</NrWierszaFa>{fields}</FaWiersz></Fa></Faktura>";
+    return InvoiceXmlReader.Parse(xml).Lines.Single();
 }
 
 static void TestPefUblLineVariant()
@@ -106,6 +188,7 @@ static void TestPefUblLineVariant()
     Require(line.UnitNetPrice == "50.00", "Nie odczytano ceny pozycji PEF/UBL.");
     Require(line.NetAmount == "200.00", "Nie odczytano wartości pozycji PEF/UBL.");
     Require(line.VatAmount == "46.00", "Nie odczytano kwoty VAT pozycji PEF/UBL.");
+    Require(line.GrossAmount == "246.00", "Nie wyliczono wartości brutto pozycji PEF/UBL.");
     Require(line.VatRate == "23", "Nie odczytano stawki VAT pozycji PEF/UBL.");
 }
 
@@ -212,6 +295,26 @@ static void TestMonthlyInvoiceSummary()
         "Podsumowanie nie używa polskiego formatu kwot.");
     Require(MonthlyInvoiceSummary.FormatGrossTotals(Array.Empty<StoredInvoice>()) == "Łącznie brutto: 0,00 PLN",
         "Pusty miesiąc nie ma jednoznacznego podsumowania.");
+}
+
+static void TestInvoiceAmountSortKey()
+{
+    decimal[] input = [-120m, -318m, -57.98m, 0m, 1000m, 1237.86m, 101.98m];
+    var rows = input.Select(amount => new InvoiceRow
+    {
+        Source = new StoredInvoice { GrossAmount = amount, Currency = "PLN" }
+    }).ToList();
+
+    Require(rows.OrderBy(row => row.GrossAmountSortValue).Select(row => row.GrossAmountSortValue)
+            .SequenceEqual(input.OrderBy(amount => amount)),
+        "Klucz sortowania kwoty brutto nie sortuje wartości liczbowo rosnąco.");
+    Require(rows.OrderByDescending(row => row.GrossAmountSortValue).Select(row => row.GrossAmountSortValue)
+            .SequenceEqual(input.OrderByDescending(amount => amount)),
+        "Klucz sortowania kwoty brutto nie sortuje wartości liczbowo malejąco.");
+
+    var expected = $"{1000m.ToString("N2", CultureInfo.GetCultureInfo("pl-PL"))} PLN";
+    Require(rows.Single(row => row.GrossAmountSortValue == 1000m).GrossAmount == expected,
+        "Poprawka sortowania zmieniła polski format wyświetlanej kwoty.");
 }
 
 static void TestInvoiceNewState()

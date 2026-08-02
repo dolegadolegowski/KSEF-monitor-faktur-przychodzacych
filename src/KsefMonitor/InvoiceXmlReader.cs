@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Xml;
 using System.Xml.Linq;
@@ -74,7 +75,27 @@ internal static class InvoiceXmlReader
 
             var vatRate = FirstValue(line, "P_12", "StawkaPodatku", "VatRate");
             if (string.IsNullOrWhiteSpace(vatRate))
-                vatRate = FirstValue(taxCategoryElement, "Percent", "RateApplicablePercent");
+                vatRate = FirstValue(line, "P_12_XII");
+            if (string.IsNullOrWhiteSpace(vatRate))
+                vatRate = FirstValue(taxCategoryElement, "Percent", "RateApplicablePercent", "ID");
+
+            var netAmount = FirstValue(
+                line,
+                "P_11",
+                "WartoscNetto",
+                "LineExtensionAmount",
+                "LineTotalAmount",
+                "NetAmount");
+            var grossAmount = FirstValue(
+                line,
+                "P_11A",
+                "WartoscBrutto",
+                "TaxInclusiveLineExtensionAmount",
+                "GrossLineAmount",
+                "GrossAmount");
+            var completedAmounts = CompleteLineAmounts(netAmount, vatAmount, grossAmount, vatRate);
+            vatAmount = completedAmounts.VatAmount;
+            grossAmount = completedAmounts.GrossAmount;
 
             result.Lines.Add(new InvoiceLine(
                 FirstValue(line, "NrWierszaFa", "LineNumber", "ID", "LineID"),
@@ -86,15 +107,127 @@ internal static class InvoiceXmlReader
                 FirstValue(line, "P_10", "Rabat", "Discount", "AllowanceAmount") is { Length: > 0 } discount
                     ? discount
                     : FirstValue(allowanceElement, "Amount", "ActualAmount"),
-                FirstValue(line, "P_11", "WartoscNetto", "LineExtensionAmount", "LineTotalAmount", "NetAmount"),
-                FirstValue(line, "P_11A", "WartoscBrutto", "TaxInclusiveLineExtensionAmount", "GrossLineAmount", "GrossAmount"),
+                netAmount,
+                grossAmount,
                 vatAmount,
-                vatRate));
+                vatRate,
+                completedAmounts.IsVatCalculated,
+                completedAmounts.IsGrossCalculated));
         }
 
         Flatten(xdoc.Root, $"/{xdoc.Root.Name.LocalName}", result.Fields);
         return result;
     }
+
+    private static (string VatAmount, string GrossAmount, bool IsVatCalculated, bool IsGrossCalculated) CompleteLineAmounts(
+        string netAmount,
+        string vatAmount,
+        string grossAmount,
+        string vatRate)
+    {
+        var hasNet = TryParseXmlDecimal(netAmount, out var net);
+        var hasVat = TryParseXmlDecimal(vatAmount, out var vat);
+        var hasGross = TryParseXmlDecimal(grossAmount, out var gross);
+        var isVatCalculated = false;
+        var isGrossCalculated = false;
+
+        try
+        {
+            // FA(3) dopuszcza brak P_11Vat. W takim przypadku kwotę podatku
+            // wyliczamy wyłącznie z dostępnych kwot i stawki, nie zastępując
+            // wartości jawnie podanej przez wystawcę.
+            if (string.IsNullOrWhiteSpace(vatAmount))
+            {
+                if (hasNet && hasGross)
+                {
+                    vat = RoundCurrency(gross - net);
+                    hasVat = true;
+                }
+                else if (TryGetVatPercentage(vatRate, out var percentage))
+                {
+                    if (hasNet)
+                    {
+                        vat = RoundCurrency(net * percentage / 100m);
+                        hasVat = true;
+                    }
+                    else if (hasGross)
+                    {
+                        // Wariant ceny brutto z P_11A: KP = WB × SP / (100 + SP).
+                        vat = RoundCurrency(gross * percentage / (100m + percentage));
+                        hasVat = true;
+                    }
+                }
+
+                if (hasVat) vatAmount = FormatCalculatedMoney(vat);
+                isVatCalculated = hasVat;
+            }
+
+            if (string.IsNullOrWhiteSpace(grossAmount) && hasNet && hasVat)
+            {
+                gross = RoundCurrency(net + vat);
+                grossAmount = FormatCalculatedMoney(gross);
+                isGrossCalculated = true;
+            }
+            else if (string.IsNullOrWhiteSpace(grossAmount) && hasNet && IsGrossEqualToNetCategory(vatRate))
+            {
+                // Zwolnienie, odwrotne obciążenie i sprzedaż niepodlegająca VAT
+                // nie są stawką 0%. Wyliczamy brutto, ale Kwotę VAT pozostawiamy pustą.
+                grossAmount = FormatCalculatedMoney(RoundCurrency(net));
+                isGrossCalculated = true;
+            }
+        }
+        catch (OverflowException)
+        {
+            // Schemat KSeF ogranicza zakres kwot. Dla wartości spoza zakresu
+            // decimal pozostawiamy pola niewyliczone zamiast blokować podgląd XML.
+        }
+
+        return (vatAmount, grossAmount, isVatCalculated, isGrossCalculated);
+    }
+
+    private static bool TryParseXmlDecimal(string? value, out decimal result)
+    {
+        const NumberStyles styles =
+            NumberStyles.AllowLeadingWhite |
+            NumberStyles.AllowTrailingWhite |
+            NumberStyles.AllowLeadingSign |
+            NumberStyles.AllowDecimalPoint;
+        return decimal.TryParse(value, styles, CultureInfo.InvariantCulture, out result);
+    }
+
+    private static bool TryGetVatPercentage(string? value, out decimal percentage)
+    {
+        percentage = 0;
+        if (string.IsNullOrWhiteSpace(value)) return false;
+
+        var normalized = string.Join(
+                " ",
+                value.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .ToUpperInvariant();
+        if (normalized.EndsWith('%')) normalized = normalized[..^1].TrimEnd();
+
+        if (TryParseXmlDecimal(normalized, out percentage))
+            return percentage is >= 0 and <= 100;
+
+        // Stawki 0% w FA(3) oraz odpowiadające im kategorie UBL/PEF.
+        return normalized is "0 KR" or "0 WDT" or "0 EX" or "Z" or "G" or "K";
+    }
+
+    private static bool IsGrossEqualToNetCategory(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        var normalized = string.Join(
+                " ",
+                value.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .ToUpperInvariant();
+        return normalized is "ZW" or "OO" or "NP" or "NP I" or "NP II" or "E" or "AE" or "O";
+    }
+
+    private static decimal RoundCurrency(decimal value) =>
+        decimal.Round(value, 2, MidpointRounding.AwayFromZero);
+
+    private static string FormatCalculatedMoney(decimal value) =>
+        value.ToString("0.00", CultureInfo.InvariantCulture);
 
     private static void Flatten(XElement element, string path, ICollection<InvoiceField> target)
     {
