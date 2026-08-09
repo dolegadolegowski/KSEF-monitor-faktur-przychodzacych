@@ -16,5 +16,11 @@
     <Compile Include="..\..\src\KsefMonitor\ApplicationLog.cs" Link="ApplicationLog.cs" />
     <Compile Include="..\..\src\KsefMonitor\SecretRedactor.cs" Link="SecretRedactor.cs" />
     <Compile Include="..\..\src\KsefMonitor\UserFacingErrors.cs" Link="UserFacingErrors.cs" />
+    <Compile Include="..\..\src\KsefMonitor\ProductInformation.cs" Link="ProductInformation.cs" />
+    <Compile Include="..\..\src\KsefMonitor\AppUpdateModels.cs" Link="AppUpdateModels.cs" />
+    <Compile Include="..\..\src\KsefMonitor\GitHubUpdateClient.cs" Link="GitHubUpdateClient.cs" />
+    <Compile Include="..\..\src\KsefMonitor\AppUpdateService.cs" Link="AppUpdateService.cs" />
+    <Compile Include="..\..\src\KsefMonitor\Storage.cs" Link="Storage.cs" />
+    <Compile Include="..\..\src\KsefMonitor\UpdateInstaller.cs" Link="UpdateInstaller.cs" />
   </ItemGroup>
 </Project>

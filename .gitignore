@@ -6,6 +6,8 @@
 bin/
 obj/
 artifacts/
+release/
+updater-test/
 TestResults/
 coverage/
 *.user
@@ -40,3 +42,5 @@ mydr-state.dat
 /private-fixtures/
 /diagnostics/
 /screenshots-private/
+.ksef-update/
+update-failure.txt

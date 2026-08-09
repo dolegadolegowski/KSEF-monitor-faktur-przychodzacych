@@ -7,6 +7,11 @@ on:
 
 permissions:
   contents: write
+  attestations: read
+
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
 
 jobs:
   build-and-release:
@@ -39,6 +44,33 @@ jobs:
       - name: Uruchom testy
         run: dotnet run --project .\tests\KsefMonitor.SmokeTests\KsefMonitor.SmokeTests.csproj -c Release
 
+      - name: Zbuduj pliki integracyjnego testu aktualizatora
+        shell: pwsh
+        run: |
+          dotnet publish .\src\KsefMonitor\KsefMonitor.csproj `
+            -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:Version=0.5.9 `
+            -p:AssemblyVersion=0.5.9.0 `
+            -p:FileVersion=0.5.9.0 `
+            -p:InformationalVersion=0.5.9-updater-test `
+            -o .\updater-test\old
+          if ($LASTEXITCODE -ne 0) { throw "Nie zbudowano starej wersji testowej aktualizatora." }
+          dotnet publish .\tests\KsefMonitor.UpdateFixture\KsefMonitor.UpdateFixture.csproj `
+            -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -o .\updater-test\new
+          if ($LASTEXITCODE -ne 0) { throw "Nie zbudowano nowej wersji testowej aktualizatora." }
+
+      - name: Przetestuj podmianę, restart i rollback EXE
+        shell: pwsh
+        run: >-
+          .\scripts\test-updater-integration.ps1
+          -OldExe .\updater-test\old\KSeFMonitor.exe
+          -NewExe .\updater-test\new\KSeFMonitor.exe
+
       - name: Zbuduj pojedynczy plik EXE
         run: >-
           dotnet publish .\src\KsefMonitor\KsefMonitor.csproj
@@ -49,21 +81,226 @@ jobs:
           -p:IncludeNativeLibrariesForSelfExtract=true
           -o .\release
 
+      - name: Sprawdź format i FileVersion opublikowanego EXE
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          dotnet run --project .\tests\KsefMonitor.SmokeTests\KsefMonitor.SmokeTests.csproj -c Release --no-build --
+          --published-exe .\release\KSeFMonitor.exe
+          --expected-version "$($env:RELEASE_TAG.Substring(1))"
+
       - name: Utwórz sumę SHA-256
         shell: pwsh
         run: |
           $hash = (Get-FileHash .\release\KSeFMonitor.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  KSeFMonitor.exe" | Set-Content .\release\KSeFMonitor.exe.sha256 -Encoding ascii
 
-      - name: Opublikuj GitHub Release
+      - name: Wymagaj potwierdzonej konfiguracji niezmiennych wydań
+        shell: pwsh
+        env:
+          IMMUTABLE_RELEASES_ENABLED: ${{ vars.IMMUTABLE_RELEASES_ENABLED }}
+        run: |
+          if ($env:IMMUTABLE_RELEASES_ENABLED -cne 'true') {
+            throw "Najpierw włącz GitHub Immutable Releases i ustaw zmienną repozytorium IMMUTABLE_RELEASES_ENABLED=true."
+          }
+
+      - name: Przygotuj wersję roboczą GitHub Release
+        id: prepare_release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2026-03-10'
+          }
+          $releaseUri = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG"
+          $response = $null
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+              $response = Invoke-WebRequest -Uri $releaseUri -Headers $headers -SkipHttpErrorCheck
+            }
+            catch {
+              if ($attempt -eq 6) { throw "Nie udało się sprawdzić istniejącego wydania: $($_.Exception.Message)" }
+              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
+              continue
+            }
+
+            if ($response.StatusCode -eq 200 -or $response.StatusCode -eq 404) { break }
+            if (($response.StatusCode -eq 429 -or $response.StatusCode -ge 500) -and $attempt -lt 6) {
+              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
+              continue
+            }
+            throw "GitHub zwrócił HTTP $($response.StatusCode) podczas sprawdzania istniejącego wydania."
+          }
+
+          if ($null -eq $response) { throw 'GitHub nie zwrócił odpowiedzi podczas sprawdzania istniejącego wydania.' }
+          if ($response.StatusCode -eq 200) {
+            $existing = $response.Content | ConvertFrom-Json
+            if ($existing.draft) {
+              "already_published=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              Write-Host "Ponowne użycie istniejącego szkicu wydania $env:RELEASE_TAG."
+            }
+            else {
+              "already_published=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              Write-Host "Wydanie $env:RELEASE_TAG jest już publiczne; workflow tylko je ponownie zweryfikuje."
+            }
+            exit 0
+          }
+          if ($response.StatusCode -ne 404) {
+            throw "Nie można bezpiecznie ustalić, czy wydanie już istnieje (HTTP $($response.StatusCode))."
+          }
+
+          gh release create "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --title "KSeF Monitor $env:RELEASE_TAG" `
+            --verify-tag `
+            --draft `
+            --latest=false `
+            --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "Nie udało się utworzyć szkicu GitHub Release." }
+          "already_published=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Wyślij lub zastąp assety szkicu
+        if: steps.prepare_release.outputs.already_published != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$env:RELEASE_TAG" `
+            .\release\KSeFMonitor.exe `
+            .\release\KSeFMonitor.exe.sha256 `
+            --repo "${{ github.repository }}" `
+            --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Nie udało się wysłać assetów szkicu wydania." }
+
+      - name: Zweryfikuj kanał automatycznych aktualizacji
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ALREADY_PUBLISHED: ${{ steps.prepare_release.outputs.already_published }}
+        run: |
+          $localExeHash = (Get-FileHash .\release\KSeFMonitor.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $localChecksumHash = (Get-FileHash .\release\KSeFMonitor.exe.sha256 -Algorithm SHA256).Hash.ToLowerInvariant()
+          $localExeSize = (Get-Item .\release\KSeFMonitor.exe).Length
+          $localChecksumSize = (Get-Item .\release\KSeFMonitor.exe.sha256).Length
+          $verified = $false
+          $lastReason = "Brak metadanych wydania."
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $releaseJson = gh api "repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $release = $releaseJson | ConvertFrom-Json
+              $exeAssets = @($release.assets | Where-Object { $_.name -ceq 'KSeFMonitor.exe' -and $_.state -ceq 'uploaded' })
+              $checksumAssets = @($release.assets | Where-Object { $_.name -ceq 'KSeFMonitor.exe.sha256' -and $_.state -ceq 'uploaded' })
+              if ($release.prerelease) {
+                $lastReason = "Wydanie jest oznaczone jako prerelease."
+              }
+              elseif (@($release.assets).Count -ne 2 -or $exeAssets.Count -ne 1 -or $checksumAssets.Count -ne 1) {
+                $lastReason = "Wydanie nie zawiera dokładnie dwóch oczekiwanych assetów."
+              }
+              elseif ($release.tag_name -cne $env:RELEASE_TAG -or $exeAssets[0].size -ne $localExeSize -or $checksumAssets[0].size -ne $localChecksumSize) {
+                $lastReason = "Tag lub rozmiary assetów nie zgadzają się z lokalnym wydaniem."
+              }
+              elseif ($exeAssets[0].digest -cne "sha256:$localExeHash") {
+                $lastReason = "Digest EXE nie zgadza się z lokalnym artefaktem."
+              }
+              elseif ($checksumAssets[0].digest -cne "sha256:$localChecksumHash") {
+                $lastReason = "Digest pliku checksum nie zgadza się z lokalnym artefaktem."
+              }
+              elseif ($env:ALREADY_PUBLISHED -eq 'true' -and $release.draft) {
+                $lastReason = "Wcześniej opublikowane wydanie nie może być szkicem."
+              }
+              elseif ($env:ALREADY_PUBLISHED -ne 'true' -and -not $release.draft) {
+                $lastReason = "Nowe wydanie zostało opublikowane przed zakończeniem weryfikacji."
+              }
+              else {
+                $verified = $true
+                break
+              }
+            }
+            Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 30))
+          }
+          if (-not $verified) { throw "Nie zweryfikowano kanału aktualizacji: $lastReason" }
+
+      - name: Opublikuj zweryfikowane, najnowsze wydanie
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $release = gh api "repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Nie udało się ponownie odczytać wydania przed publikacją." }
+
+          $newVersion = [version]$env:RELEASE_TAG.Substring(1)
+          $latestBeforeJson = gh api "repos/${{ github.repository }}/releases/latest" 2>$null
+          $latestBefore = if ($LASTEXITCODE -eq 0) { $latestBeforeJson | ConvertFrom-Json } else { $null }
+          if ($null -ne $latestBefore -and $latestBefore.tag_name -match '^v\d+\.\d+\.\d+$') {
+            $latestVersion = [version]$latestBefore.tag_name.Substring(1)
+            if ($latestVersion -gt $newVersion) {
+              throw "Istnieje już nowsze wydanie $($latestBefore.tag_name). Starszy tag nie zostanie opublikowany jako latest."
+            }
+          }
+
+          if ($release.draft) {
+            gh release edit "$env:RELEASE_TAG" `
+              --repo "${{ github.repository }}" `
+              --draft=false `
+              --prerelease=false `
+              --verify-tag `
+              --latest
+            if ($LASTEXITCODE -ne 0) { throw "Nie udało się opublikować zweryfikowanego wydania." }
+          }
+
+          $verifiedLatest = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $latestJson = gh api "repos/${{ github.repository }}/releases/latest" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $latest = $latestJson | ConvertFrom-Json
+              if ($latest.tag_name -ceq $env:RELEASE_TAG -and -not $latest.draft -and -not $latest.prerelease -and $latest.immutable) {
+                $verifiedLatest = $true
+                break
+              }
+            }
+            Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 30))
+          }
+          if (-not $verifiedLatest) {
+            throw "GitHub nie udostępnił oczekiwanego, niezmiennego wydania jako latest."
+          }
+
+      - name: Zweryfikuj poświadczenie niezmiennego wydania
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $verified = $false
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            gh release verify "$env:RELEASE_TAG" --repo "${{ github.repository }}" *> $null
+            $releaseOk = $LASTEXITCODE -eq 0
+            gh release verify-asset "$env:RELEASE_TAG" .\release\KSeFMonitor.exe --repo "${{ github.repository }}" *> $null
+            $exeOk = $LASTEXITCODE -eq 0
+            gh release verify-asset "$env:RELEASE_TAG" .\release\KSeFMonitor.exe.sha256 --repo "${{ github.repository }}" *> $null
+            $checksumOk = $LASTEXITCODE -eq 0
+            if ($releaseOk -and $exeOk -and $checksumOk) {
+              $verified = $true
+              break
+            }
+            Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 30))
+          }
+          if (-not $verified) {
+            throw "GitHub nie potwierdził poświadczenia wydania lub zgodności lokalnych assetów."
+          }
+
+      - name: Sprawdź publiczny kanał oczami aplikacji
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: >-
-          gh release create "$env:RELEASE_TAG"
-          .\release\KSeFMonitor.exe
-          .\release\KSeFMonitor.exe.sha256
-          --repo "${{ github.repository }}"
-          --title "KSeF Monitor $env:RELEASE_TAG"
-          --generate-notes
+          dotnet run --project .\tests\KsefMonitor.SmokeTests\KsefMonitor.SmokeTests.csproj -c Release --no-build --
+          --live-github
+          --expected-tag "$env:RELEASE_TAG"

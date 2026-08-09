@@ -21,6 +21,7 @@ internal sealed class MainWindow : Window
     private readonly AppStore _store;
     private readonly SynchronizationService _synchronization;
     private readonly MyDrSynchronizationService _myDrSynchronization;
+    private readonly AppUpdateService _updates;
     private readonly DataGrid _grid = new();
     private readonly TextBlock _monthLabel = new();
     private readonly TextBlock _ksefMonthSummary = new();
@@ -29,6 +30,8 @@ internal sealed class MainWindow : Window
     private readonly Button _previousMonth = new();
     private readonly Button _nextMonth = new();
     private readonly Button _refreshButton = new();
+    private readonly Button _updateButton = new();
+    private readonly Button _versionButton = new();
     private readonly System.Drawing.Icon _trayIcon;
     private readonly Forms.ContextMenuStrip _trayMenu;
     private readonly Forms.NotifyIcon _notifyIcon;
@@ -43,11 +46,13 @@ internal sealed class MainWindow : Window
     public MainWindow(
         AppStore store,
         SynchronizationService synchronization,
-        MyDrSynchronizationService myDrSynchronization)
+        MyDrSynchronizationService myDrSynchronization,
+        AppUpdateService updates)
     {
         _store = store;
         _synchronization = synchronization;
         _myDrSynchronization = myDrSynchronization;
+        _updates = updates;
         Title = "KSeF Monitor — Faktury otrzymane";
         Width = 1040;
         Height = 680;
@@ -66,6 +71,7 @@ internal sealed class MainWindow : Window
         _synchronization.NewInvoicesDiscovered += OnNewInvoicesDiscovered;
         _myDrSynchronization.StatusChanged += OnStatusChanged;
         _myDrSynchronization.StateChanged += OnMyDrStateChanged;
+        _updates.StateChanged += OnUpdateStateChanged;
 
         Loaded += OnLoaded;
         Closing += OnClosing;
@@ -77,6 +83,7 @@ internal sealed class MainWindow : Window
         };
         _clock.Start();
         RefreshRows();
+        ApplyUpdateUi(_updates.GetSnapshot());
     }
 
     private Grid BuildContent()
@@ -246,17 +253,32 @@ internal sealed class MainWindow : Window
         footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         footerGrid.Children.Add(_status);
-        var versionButton = new Button
+        var footerActions = new StackPanel
         {
-            Content = GetDisplayVersion(),
-            FontSize = 11,
-            Padding = new Thickness(8, 3, 8, 3),
-            Cursor = Cursors.Hand,
-            ToolTip = "Otwórz ustawienia aplikacji"
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center
         };
-        versionButton.Click += (_, _) => OpenSettings();
-        Grid.SetColumn(versionButton, 1);
-        footerGrid.Children.Add(versionButton);
+        _updateButton.Content = "Aktualizuj";
+        _updateButton.FontSize = 11;
+        _updateButton.Padding = new Thickness(8, 3, 8, 3);
+        _updateButton.Margin = new Thickness(0, 0, 6, 0);
+        _updateButton.Cursor = Cursors.Hand;
+        _updateButton.Background = new SolidColorBrush(Color.FromRgb(36, 122, 72));
+        _updateButton.Foreground = Brushes.White;
+        _updateButton.BorderBrush = new SolidColorBrush(Color.FromRgb(36, 122, 72));
+        _updateButton.Visibility = Visibility.Collapsed;
+        _updateButton.Click += async (_, _) => await InstallUpdateAsync().ConfigureAwait(true);
+        footerActions.Children.Add(_updateButton);
+
+        _versionButton.Content = GetDisplayVersion();
+        _versionButton.FontSize = 11;
+        _versionButton.Padding = new Thickness(8, 3, 8, 3);
+        _versionButton.Cursor = Cursors.Hand;
+        _versionButton.ToolTip = "Otwórz ustawienia aplikacji";
+        _versionButton.Click += (_, _) => OpenSettings();
+        footerActions.Children.Add(_versionButton);
+        Grid.SetColumn(footerActions, 1);
+        footerGrid.Children.Add(footerActions);
         footer.Child = footerGrid;
         Grid.SetRow(footer, 2);
         root.Children.Add(footer);
@@ -298,12 +320,65 @@ internal sealed class MainWindow : Window
     {
         _synchronization.Start();
         _myDrSynchronization.Start();
+        _ = CheckForUpdatesAtStartupAsync();
         if (_store.ConsumeLoadWarning() is not null)
             ShowStatus(new AppStatusMessage(
                 "Nie udało się wczytać części zapisanych danych. Aplikacja użyła bezpiecznej kopii lub ustawień domyślnych.",
                 StatusSeverity.Error));
         if (!_synchronization.IsConfigured)
             Dispatcher.BeginInvoke(OpenSettings, DispatcherPriority.ApplicationIdle);
+    }
+
+    private async System.Threading.Tasks.Task CheckForUpdatesAtStartupAsync()
+    {
+        try
+        {
+            await _updates.CheckForUpdatesAsync(force: false).ConfigureAwait(true);
+        }
+        catch (Exception exception)
+        {
+            _store.Log.Warning("Aktualizacja", "Nieoczekiwany błąd wywołania sprawdzania przy starcie.", exception);
+        }
+    }
+
+    private async System.Threading.Tasks.Task InstallUpdateAsync()
+    {
+        var snapshot = _updates.GetSnapshot();
+        if (snapshot.AvailableRelease is not { } release) return;
+        var answer = System.Windows.MessageBox.Show(
+            $"Zainstalować KSeF Monitor v{release.Version}?\n\nAplikacja pobierze plik z GitHuba, sprawdzi jego integralność, zamknie się i uruchomi ponownie.",
+            "Aktualizacja KSeF Monitor",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Information);
+        if (answer != MessageBoxResult.Yes) return;
+
+        _updateButton.IsEnabled = false;
+        try
+        {
+            await _updates.PrepareAndLaunchUpdateAsync().ConfigureAwait(true);
+            ((App)System.Windows.Application.Current).ExitApplication();
+        }
+        catch (AppUpdateException exception)
+        {
+            ShowStatus(new AppStatusMessage(exception.UserMessage, StatusSeverity.Error));
+            System.Windows.MessageBox.Show(
+                exception.UserMessage,
+                "Nie udało się zainstalować aktualizacji",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+        catch (Exception exception)
+        {
+            _store.Log.Error("Aktualizacja", "Nieoczekiwany błąd obsługi aktualizacji w interfejsie.", exception);
+            const string message = "Nie udało się zainstalować aktualizacji. Aplikacja nie została zmieniona.";
+            ShowStatus(new AppStatusMessage(message, StatusSeverity.Error));
+            System.Windows.MessageBox.Show(message, "Nie udało się zainstalować aktualizacji", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            if (!_reallyClose && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+                ApplyUpdateUi(_updates.GetSnapshot());
+        }
     }
 
     private async System.Threading.Tasks.Task RefreshManuallyAsync()
@@ -330,7 +405,7 @@ internal sealed class MainWindow : Window
     private void OpenSettings()
     {
         ShowFromTray();
-        var window = new SettingsWindow(_store, _myDrSynchronization) { Owner = this };
+        var window = new SettingsWindow(_store, _myDrSynchronization, _updates) { Owner = this };
         window.ShowDialog();
         if (window.ConfigurationChanged)
         {
@@ -425,8 +500,64 @@ internal sealed class MainWindow : Window
 
     private static string GetDisplayVersion()
     {
-        var version = typeof(MainWindow).Assembly.GetName().Version;
-        return version is null ? "v?" : $"v{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
+        return ProductInformation.DisplayVersion;
+    }
+
+    private void OnUpdateStateChanged(object? sender, EventArgs e)
+    {
+        if (_reallyClose || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (!_reallyClose && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+                ApplyUpdateUi(_updates.GetSnapshot());
+        });
+    }
+
+    private void ApplyUpdateUi(AppUpdateSnapshot snapshot)
+    {
+        _versionButton.ToolTip = snapshot.Phase switch
+        {
+            _ when snapshot.HasError => $"{ProductInformation.DisplayVersion} • {snapshot.Message}\nKliknij, aby otworzyć ustawienia.",
+            AppUpdatePhase.Checking => $"{ProductInformation.DisplayVersion} • sprawdzanie aktualizacji…\nKliknij, aby otworzyć ustawienia.",
+            AppUpdatePhase.UpToDate => $"{ProductInformation.DisplayVersion} • najnowsza wersja\nKliknij, aby otworzyć ustawienia.",
+            AppUpdatePhase.Available or AppUpdatePhase.Downloading or AppUpdatePhase.Preparing or AppUpdatePhase.ReadyToRestart
+                when snapshot.AvailableRelease is { } release =>
+                $"Zainstalowana: {ProductInformation.DisplayVersion} • dostępna: v{release.Version}\nKliknij, aby otworzyć ustawienia.",
+            AppUpdatePhase.Failed => $"{ProductInformation.DisplayVersion} • nie udało się sprawdzić lub przygotować aktualizacji\nKliknij, aby otworzyć ustawienia.",
+            _ => $"{ProductInformation.DisplayVersion}\nKliknij, aby otworzyć ustawienia."
+        };
+
+        if (!snapshot.HasAvailableUpdate)
+        {
+            _updateButton.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        _updateButton.Visibility = Visibility.Visible;
+        _updateButton.ToolTip = snapshot.Message ?? $"Zainstaluj v{snapshot.AvailableRelease!.Version}.";
+        switch (snapshot.Phase)
+        {
+            case AppUpdatePhase.Checking:
+                _updateButton.Content = "Sprawdzanie…";
+                _updateButton.IsEnabled = false;
+                break;
+            case AppUpdatePhase.Downloading:
+                _updateButton.Content = snapshot.ProgressPercent is { } percent ? $"Pobieranie {percent}%" : "Pobieranie…";
+                _updateButton.IsEnabled = false;
+                break;
+            case AppUpdatePhase.Preparing:
+                _updateButton.Content = "Instalowanie…";
+                _updateButton.IsEnabled = false;
+                break;
+            case AppUpdatePhase.ReadyToRestart:
+                _updateButton.Content = "Restart…";
+                _updateButton.IsEnabled = false;
+                break;
+            default:
+                _updateButton.Content = "Aktualizuj";
+                _updateButton.IsEnabled = true;
+                break;
+        }
     }
 
     private static string FormatCountdown(TimeSpan remaining)
@@ -475,6 +606,8 @@ internal sealed class MainWindow : Window
         _status.Foreground = status.IsError ? Brushes.Firebrick : Brushes.DimGray;
         _status.FontWeight = status.IsError ? FontWeights.SemiBold : FontWeights.Normal;
     }
+
+    internal void ShowStatusMessage(AppStatusMessage status) => ShowStatus(status);
 
     private void ExpireStatusIfNeeded()
     {
@@ -638,6 +771,7 @@ internal sealed class MainWindow : Window
         _synchronization.NewInvoicesDiscovered -= OnNewInvoicesDiscovered;
         _myDrSynchronization.StatusChanged -= OnStatusChanged;
         _myDrSynchronization.StateChanged -= OnMyDrStateChanged;
+        _updates.StateChanged -= OnUpdateStateChanged;
         _notifyIcon.Visible = false;
         _notifyIcon.Dispose();
         _trayMenu.Dispose();

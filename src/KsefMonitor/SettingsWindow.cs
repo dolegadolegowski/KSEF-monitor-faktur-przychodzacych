@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Threading;
@@ -15,6 +16,7 @@ internal sealed class SettingsWindow : Window
 {
     private readonly AppStore _store;
     private readonly MyDrSynchronizationService _myDr;
+    private readonly AppUpdateService _updates;
     private readonly TextBox _nip = new();
     private readonly PasswordBox _token = new();
     private readonly CheckBox _notifications = new();
@@ -35,6 +37,11 @@ internal sealed class SettingsWindow : Window
     private readonly Button _myDrSaveButton = new();
     private readonly Button _myDrRefreshButton = new();
     private readonly Button _myDrDeleteButton = new();
+    private readonly TextBlock _updateStatus = new();
+    private readonly TextBlock _updateVersion = new();
+    private readonly Button _updateCheckButton = new();
+    private readonly Button _updateInstallButton = new();
+    private readonly Button _updateReleasePageButton = new();
     private readonly DispatcherTimer _myDrStatusTimer;
     private TabItem? _logTab;
     private bool _requiresProductionToken;
@@ -45,10 +52,11 @@ internal sealed class SettingsWindow : Window
     private bool _myDrStatusReadFailed;
     private bool _isClosing;
 
-    public SettingsWindow(AppStore store, MyDrSynchronizationService myDr)
+    public SettingsWindow(AppStore store, MyDrSynchronizationService myDr, AppUpdateService updates)
     {
         _store = store;
         _myDr = myDr;
+        _updates = updates;
         Title = "Ustawienia aplikacji";
         Width = 700;
         Height = 620;
@@ -66,11 +74,14 @@ internal sealed class SettingsWindow : Window
         };
         _myDrStatusTimer.Tick += (_, _) => RefreshMyDrStatus();
         _myDrStatusTimer.Start();
+        _updates.StateChanged += OnUpdateStateChanged;
+        Loaded += async (_, _) => await CheckUpdatesOnOpenAsync().ConfigureAwait(true);
         Closing += (_, _) =>
         {
             _isClosing = true;
             _testCancellation?.Cancel();
             _myDrStatusTimer.Stop();
+            _updates.StateChanged -= OnUpdateStateChanged;
         };
     }
 
@@ -83,6 +94,8 @@ internal sealed class SettingsWindow : Window
         var myDrTab = new TabItem { Header = "MyDR", Content = BuildMyDrContent() };
         tabs.Items.Add(ksefTab);
         tabs.Items.Add(myDrTab);
+        var updatesTab = new TabItem { Header = "Aktualizacje", Content = BuildUpdatesContent() };
+        tabs.Items.Add(updatesTab);
         _logTab = new TabItem { Header = "Dziennik", Content = BuildLogContent() };
         tabs.Items.Add(_logTab);
         tabs.SelectionChanged += (_, e) =>
@@ -90,6 +103,7 @@ internal sealed class SettingsWindow : Window
             if (!ReferenceEquals(e.Source, tabs)) return;
             _saveButton.IsDefault = ReferenceEquals(tabs.SelectedItem, ksefTab);
             _myDrSaveButton.IsDefault = ReferenceEquals(tabs.SelectedItem, myDrTab);
+            if (ReferenceEquals(tabs.SelectedItem, updatesTab)) ApplyUpdateStatus(_updates.GetSnapshot());
             if (ReferenceEquals(tabs.SelectedItem, _logTab)) RefreshLog();
         };
         return tabs;
@@ -330,6 +344,212 @@ internal sealed class SettingsWindow : Window
             HorizontalContentAlignment = HorizontalAlignment.Stretch,
             VerticalContentAlignment = VerticalAlignment.Top
         };
+    }
+
+    private Grid BuildUpdatesContent()
+    {
+        var root = new Grid { Margin = new Thickness(22) };
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var heading = new StackPanel { Margin = new Thickness(0, 0, 0, 22) };
+        heading.Children.Add(new TextBlock
+        {
+            Text = "Aktualizacje aplikacji",
+            FontSize = 24,
+            FontWeight = FontWeights.SemiBold
+        });
+        heading.Children.Add(new TextBlock
+        {
+            Text = "Aplikacja sprawdza publiczne wydania w oficjalnym repozytorium GitHub przy każdym uruchomieniu i po otwarciu ustawień.",
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 5, 0, 0)
+        });
+        root.Children.Add(heading);
+
+        var panel = new StackPanel { VerticalAlignment = VerticalAlignment.Top };
+        var versionRow = new Grid { Margin = new Thickness(0, 0, 0, 18) };
+        versionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(170) });
+        versionRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        versionRow.Children.Add(new TextBlock
+        {
+            Text = "Zainstalowana wersja",
+            FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        _updateVersion.Text = ProductInformation.DisplayVersion;
+        _updateVersion.FontSize = 16;
+        _updateVersion.FontWeight = FontWeights.SemiBold;
+        Grid.SetColumn(_updateVersion, 1);
+        versionRow.Children.Add(_updateVersion);
+        panel.Children.Add(versionRow);
+
+        var statusBorder = new Border
+        {
+            Background = new SolidColorBrush(Color.FromRgb(245, 247, 250)),
+            BorderBrush = new SolidColorBrush(Color.FromRgb(218, 223, 230)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(5),
+            Padding = new Thickness(14)
+        };
+        _updateStatus.TextWrapping = TextWrapping.Wrap;
+        _updateStatus.Text = "Jeszcze nie sprawdzono aktualizacji.";
+        statusBorder.Child = _updateStatus;
+        panel.Children.Add(statusBorder);
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Przed instalacją aplikacja porównuje wersję, rozmiar i dwie sumy SHA-256. Następnie tworzy kopię poprzedniego EXE i automatycznie ją przywraca, jeśli nowa wersja nie uruchomi się poprawnie.",
+            Foreground = Brushes.DimGray,
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Margin = new Thickness(0, 16, 0, 0)
+        });
+        Grid.SetRow(panel, 1);
+        root.Children.Add(panel);
+
+        var actions = new WrapPanel { HorizontalAlignment = HorizontalAlignment.Right };
+        _updateCheckButton.Content = "Sprawdź teraz";
+        _updateCheckButton.Padding = new Thickness(14, 7, 14, 7);
+        _updateCheckButton.Margin = new Thickness(0, 0, 10, 0);
+        _updateCheckButton.Click += async (_, _) => await CheckUpdatesManuallyAsync().ConfigureAwait(true);
+        actions.Children.Add(_updateCheckButton);
+
+        _updateReleasePageButton.Content = "Strona wydania";
+        _updateReleasePageButton.Padding = new Thickness(14, 7, 14, 7);
+        _updateReleasePageButton.Margin = new Thickness(0, 0, 10, 0);
+        _updateReleasePageButton.Visibility = Visibility.Collapsed;
+        _updateReleasePageButton.Click += (_, _) => OpenReleasePage();
+        actions.Children.Add(_updateReleasePageButton);
+
+        _updateInstallButton.Content = "Zainstaluj aktualizację";
+        _updateInstallButton.Padding = new Thickness(14, 7, 14, 7);
+        _updateInstallButton.Visibility = Visibility.Collapsed;
+        _updateInstallButton.Click += async (_, _) => await InstallUpdateFromSettingsAsync().ConfigureAwait(true);
+        actions.Children.Add(_updateInstallButton);
+        Grid.SetRow(actions, 2);
+        root.Children.Add(actions);
+        ApplyUpdateStatus(_updates.GetSnapshot());
+        return root;
+    }
+
+    private async Task CheckUpdatesOnOpenAsync()
+    {
+        try
+        {
+            await _updates.CheckForUpdatesAsync(force: true).ConfigureAwait(true);
+        }
+        catch (Exception exception)
+        {
+            _store.Log.Warning("Aktualizacja", "Nieoczekiwany błąd sprawdzania po otwarciu ustawień.", exception);
+        }
+    }
+
+    private async Task CheckUpdatesManuallyAsync()
+    {
+        _updateCheckButton.IsEnabled = false;
+        try
+        {
+            await _updates.CheckForUpdatesAsync(force: true).ConfigureAwait(true);
+        }
+        finally
+        {
+            if (!_isClosing) ApplyUpdateStatus(_updates.GetSnapshot());
+        }
+    }
+
+    private async Task InstallUpdateFromSettingsAsync()
+    {
+        var snapshot = _updates.GetSnapshot();
+        if (snapshot.AvailableRelease is not { } release) return;
+        if (System.Windows.MessageBox.Show(
+                $"Zainstalować KSeF Monitor v{release.Version}?\n\nAplikacja zamknie się i uruchomi ponownie.",
+                "Aktualizacja KSeF Monitor",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Information) != MessageBoxResult.Yes) return;
+        try
+        {
+            await _updates.PrepareAndLaunchUpdateAsync().ConfigureAwait(true);
+            ((App)System.Windows.Application.Current).ExitApplication();
+        }
+        catch (AppUpdateException exception)
+        {
+            if (!_isClosing)
+                System.Windows.MessageBox.Show(
+                    exception.UserMessage,
+                    "Nie udało się zainstalować aktualizacji",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            else if (Owner is MainWindow mainWindow)
+                mainWindow.ShowStatusMessage(new AppStatusMessage(exception.UserMessage, StatusSeverity.Error));
+        }
+        catch (Exception exception)
+        {
+            _store.Log.Error("Aktualizacja", "Nieoczekiwany błąd instalowania aktualizacji w ustawieniach.", exception);
+            const string message = "Nie udało się zainstalować aktualizacji. Aplikacja nie została zmieniona.";
+            if (!_isClosing)
+                System.Windows.MessageBox.Show(
+                    message,
+                    "Nie udało się zainstalować aktualizacji",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            else if (Owner is MainWindow mainWindow)
+                mainWindow.ShowStatusMessage(new AppStatusMessage(message, StatusSeverity.Error));
+        }
+        finally
+        {
+            if (!_isClosing) ApplyUpdateStatus(_updates.GetSnapshot());
+        }
+    }
+
+    private void OnUpdateStateChanged(object? sender, EventArgs e)
+    {
+        if (_isClosing || Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (!_isClosing && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished)
+                ApplyUpdateStatus(_updates.GetSnapshot());
+        });
+    }
+
+    private void ApplyUpdateStatus(AppUpdateSnapshot snapshot)
+    {
+        _updateStatus.Text = snapshot.Message ?? snapshot.Phase switch
+        {
+            AppUpdatePhase.Idle => "Jeszcze nie sprawdzono aktualizacji.",
+            AppUpdatePhase.Checking => "Sprawdzanie aktualizacji…",
+            _ => "Stan aktualizacji jest nieznany."
+        };
+        _updateStatus.Foreground = snapshot.HasError ? Brushes.Firebrick : Brushes.Black;
+        _updateStatus.FontWeight = snapshot.HasAvailableUpdate ? FontWeights.SemiBold : FontWeights.Normal;
+        _updateCheckButton.IsEnabled = snapshot.Phase is not (AppUpdatePhase.Checking or AppUpdatePhase.Downloading or AppUpdatePhase.Preparing or AppUpdatePhase.ReadyToRestart);
+        _updateInstallButton.Visibility = snapshot.HasAvailableUpdate ? Visibility.Visible : Visibility.Collapsed;
+        _updateReleasePageButton.Visibility = snapshot.AvailableRelease is not null ? Visibility.Visible : Visibility.Collapsed;
+        _updateInstallButton.IsEnabled = snapshot.Phase is AppUpdatePhase.Available or AppUpdatePhase.Failed;
+        _updateInstallButton.Content = snapshot.Phase switch
+        {
+            AppUpdatePhase.Downloading when snapshot.ProgressPercent is { } percent => $"Pobieranie {percent}%…",
+            AppUpdatePhase.Preparing => "Przygotowywanie…",
+            AppUpdatePhase.ReadyToRestart => "Ponowne uruchamianie…",
+            _ => "Zainstaluj aktualizację"
+        };
+    }
+
+    private void OpenReleasePage()
+    {
+        var uri = _updates.GetSnapshot().AvailableRelease?.ReleasePageUri;
+        if (uri is null) return;
+        try
+        {
+            Process.Start(new ProcessStartInfo(uri.AbsoluteUri) { UseShellExecute = true });
+        }
+        catch (Exception exception)
+        {
+            _store.Log.Warning("Aktualizacja", "Nie udało się otworzyć strony wydania.", exception);
+            System.Windows.MessageBox.Show("Nie udało się otworzyć strony wydania w przeglądarce.", "KSeF Monitor", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
     }
 
     private Grid BuildLogContent()

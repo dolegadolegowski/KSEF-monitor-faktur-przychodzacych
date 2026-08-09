@@ -2,7 +2,7 @@
 
 Desktopowa aplikacja Windows 11 do monitorowania faktur otrzymanych w Krajowym Systemie e-Faktur (KSeF API 2.0) oraz miesięcznego obrotu usług prywatnych z MyDR.
 
-Aktualny etap: działająca wersja `0.5.2`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
+Aktualny etap: działająca wersja `0.6.0`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
 
 ## Zaimplementowane
 
@@ -36,7 +36,10 @@ Aktualny etap: działająca wersja `0.5.2`. Aplikacja łączy się wyłącznie z
 - proste komunikaty błędów na dolnej belce, wyróżnione na czerwono i automatycznie ukrywane po 30 sekundach;
 - zakładka `Dziennik` w ustawieniach z centralną redakcją tokenów, nagłówków Authorization, JWT i kluczy prywatnych;
 - tryb offline dla już zsynchronizowanych danych;
-- pojedyncza instancja aplikacji; ponowne uruchomienie przywraca istniejące okno z traya.
+- pojedyncza instancja aplikacji; ponowne uruchomienie przywraca istniejące okno z traya;
+- automatyczne sprawdzanie publicznego GitHub Release przy uruchomieniu i po otwarciu ustawień;
+- aktualizacja jednym kliknięciem z kontrolą wersji, rozmiaru, digestu GitHub i pliku SHA-256;
+- bezpieczna podmiana pojedynczego EXE po zamknięciu programu, automatyczny restart, health-check nowej wersji i rollback do kopii zapasowej po nieudanym starcie.
 
 ## Wymagania deweloperskie
 
@@ -93,7 +96,11 @@ Test obejmuje:
 - sprawdzenie filtra `Subject2` i `PermanentStorage`;
 - mapowanie metadanych faktury;
 - pobieranie pełnego XML po numerze KSeF i zachowanie statusu `NOWA` w migawkach listy;
-- wymuszenie produkcyjnego adresu API.
+- wymuszenie produkcyjnego adresu API;
+- ścisły parser SemVer i blokadę downgrade/prerelease;
+- walidację metadanych GitHub Release, dokładnych adresów i hostów przekierowań;
+- parser pliku `.sha256`, strumieniowe pobieranie z kontrolą rozmiaru i hasha;
+- atomową podmianę pliku z kopią zapasową oraz transakcję rollbacku.
 
 ## Publikacja pojedynczego pliku EXE
 
@@ -161,11 +168,38 @@ Plików `.dat` nie da się odszyfrować na innym koncie Windows. Usunięcie fold
 
 Publiczny Swagger MyDR nie udostępnia jednego raportu „wykonana procedura — kwota brutto”. Endpoint ICD-9 procedur nie zawiera ceny, a pole `value` usługi przypiętej do wizyty nie jest w schemacie opisane wprost jako brutto. Dokumentacja nie gwarantuje też wprost, że zmiana przypiętej usługi zawsze zmienia `Visit.latest_modification`; dlatego ręczne odświeżenie pomija cache i wykonuje pełne przeliczenie. Aplikacja traktuje `value` jako końcową wartość brutto usługi — zgodnie z celem tego monitora — ale przed użyciem wyniku do rozliczeń księgowych należy porównać go z raportem kontrolnym MyDR i potwierdzić z dostawcą znaczenie pola oraz listę stanów.
 
-## Publiczne wydania i przyszłe aktualizacje
+## Automatyczne aktualizacje
 
-Repozytorium źródłowe i kanał przyszłych aktualizacji: [KSEF-monitor-faktur-przychodzacych](https://github.com/dolegadolegowski/KSEF-monitor-faktur-przychodzacych).
+Repozytorium źródłowe i jedyny kanał aktualizacji: [KSEF-monitor-faktur-przychodzacych](https://github.com/dolegadolegowski/KSEF-monitor-faktur-przychodzacych).
 
-Adres repozytorium oraz endpoint najnowszego GitHub Release są zapisane w metadanych projektu i `ProductInformation`. Workflow dla tagów `v*` buduje `KSeFMonitor.exe`, oblicza SHA-256 i publikuje oba pliki jako GitHub Release. Runtime'owe poświadczenia są zapisywane wyłącznie poza repozytorium w `%LOCALAPPDATA%\KSeF Monitor`.
+Wersja `0.6.0` jest pierwszą zawierającą aktualizator, dlatego przejście z `0.5.2` lub starszej wymaga jeszcze jednego ręcznego pobrania `KSeFMonitor.exe`. Każda kolejna stabilna wersja jest wykrywana automatycznie przy starcie aplikacji i po otwarciu ustawień. Gdy GitHub udostępni nowsze wydanie, obok numeru wersji pojawia się przycisk `Aktualizuj`; ten sam mechanizm jest dostępny w zakładce `Aktualizacje`.
+
+Instalacja nie odbywa się bez wiedzy użytkownika: aplikacja automatycznie wykrywa nową wersję, a pobranie, zamknięcie programu i podmiana EXE rozpoczynają się dopiero po kliknięciu `Aktualizuj` i potwierdzeniu komunikatu.
+
+Aktualizator:
+
+- odrzuca szkice, prerelease, modyfikowalne wydania, niepoprawne tagi i wersje starsze lub równe zainstalowanej;
+- przyjmuje tylko HTTPS i dokładne adresy tego repozytorium oraz dozwolony host plików GitHub Releases;
+- wymaga dokładnie jednego `KSeFMonitor.exe` i jednego `KSeFMonitor.exe.sha256`;
+- porównuje rozmiar, digest SHA-256 z metadanych GitHub, zawartość pliku `.sha256` i hash pobranego EXE;
+- pobiera plik strumieniowo do unikalnego katalogu na tym samym dysku co aplikacja;
+- po potwierdzeniu użytkownika uruchamia kopię bieżącego, wcześniej zweryfikowanego EXE w trybie instalatora, atomowo podmienia plik przez `File.Replace` i zachowuje backup;
+- czeka na sygnał poprawnego pokazania głównego okna nowej wersji; brak sygnału lub awaria startu uruchamia rollback i ponowny start starej wersji;
+- nie usuwa kopii potrzebnej do odzyskania przerwanej transakcji i rozpoznaje stan aktualizacji przy kolejnym uruchomieniu;
+- nigdy nie zapisuje tokena GitHub ani nie podnosi automatycznie uprawnień administratora.
+
+Jeżeli aplikacja znajduje się w katalogu bez prawa zapisu, automatyczna instalacja wyświetli prosty komunikat i pozostawi dotychczasowy EXE bez zmian. Wtedy należy pobrać plik ręcznie ze strony wydania. Dane KSeF i MyDR pozostają w `%LOCALAPPDATA%\KSeF Monitor` i nie są przenoszone ani usuwane przez aktualizator.
+
+Repozytorium musi mieć włączone **Immutable Releases** oraz zmienną Actions `IMMUTABLE_RELEASES_ENABLED=true`, ustawioną dopiero po włączeniu tej ochrony. Workflow dla tagów `vMAJOR.MINOR.PATCH` nie utworzy szkicu bez tego jednorazowego potwierdzenia. Następnie sprawdza zgodność wersji projektu, uruchamia testy jednostkowe oraz integracyjny test rzeczywistej podmiany i rollbacku, po czym buduje pojedynczy EXE. GitHub Release powstaje najpierw jako szkic, jego dwa assety są porównywane z lokalnym buildem, a dopiero zweryfikowany szkic staje się publicznym `latest`. Na końcu workflow niezależnie sprawdza faktyczną niezmienność wydania, poświadczenie GitHub Release, zgodność obu lokalnych assetów i publiczny endpoint używany przez aplikację. Aplikacja odrzuca wydanie, którego API GitHuba nie oznaczy jako niezmienne. Ponowne uruchomienie workflow bezpiecznie wznawia istniejący szkic, ale nigdy nie nadpisuje opublikowanego wydania.
+
+Jednorazowa konfiguracja repozytorium wykonywana przez właściciela po `gh auth login -h github.com`:
+
+```powershell
+gh api --method PUT -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2026-03-10" repos/dolegadolegowski/KSEF-monitor-faktur-przychodzacych/immutable-releases
+gh variable set IMMUTABLE_RELEASES_ENABLED --repo dolegadolegowski/KSEF-monitor-faktur-przychodzacych --body true
+```
+
+Nową wersję publikuje się przez zmianę `Version`, `AssemblyVersion` i `FileVersion`, commit oraz wypchnięcie odpowiadającego tagu, na przykład `v0.6.1`. Dopiero zakończony powodzeniem workflow udostępnia EXE aplikacji.
 
 ## Ważne przed wdrożeniem
 
