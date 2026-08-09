@@ -150,7 +150,7 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
 
         $expectedExit = if ($SuppressHealth) { 31 } else { 0 }
         if ($helperProcess.ExitCode -ne $expectedExit) {
-            throw "Scenariusz $Name: helper zwrócił $($helperProcess.ExitCode), oczekiwano $expectedExit."
+            throw "Scenariusz ${Name}: helper zwrócił $($helperProcess.ExitCode), oczekiwano $expectedExit."
         }
         $final = Get-Content -LiteralPath $descriptorPath -Raw | ConvertFrom-Json
         if ($SuppressHealth) {
