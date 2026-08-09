@@ -112,35 +112,26 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $headers = @{
-            Accept = 'application/vnd.github+json'
-            Authorization = "Bearer $env:GH_TOKEN"
-            'X-GitHub-Api-Version' = '2026-03-10'
-          }
-          $releaseUri = "https://api.github.com/repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG"
-          $response = $null
+          $listed = $false
+          $releaseListJson = $null
           for ($attempt = 1; $attempt -le 6; $attempt++) {
-            try {
-              $response = Invoke-WebRequest -Uri $releaseUri -Headers $headers -SkipHttpErrorCheck
+            $releaseListJson = gh release list `
+              --repo "${{ github.repository }}" `
+              --limit 1000 `
+              --json tagName,isDraft,isPrerelease 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $listed = $true
+              break
             }
-            catch {
-              if ($attempt -eq 6) { throw "Nie udało się sprawdzić istniejącego wydania: $($_.Exception.Message)" }
-              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
-              continue
-            }
-
-            if ($response.StatusCode -eq 200 -or $response.StatusCode -eq 404) { break }
-            if (($response.StatusCode -eq 429 -or $response.StatusCode -ge 500) -and $attempt -lt 6) {
-              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
-              continue
-            }
-            throw "GitHub zwrócił HTTP $($response.StatusCode) podczas sprawdzania istniejącego wydania."
+            if ($attempt -lt 6) { Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20)) }
           }
 
-          if ($null -eq $response) { throw 'GitHub nie zwrócił odpowiedzi podczas sprawdzania istniejącego wydania.' }
-          if ($response.StatusCode -eq 200) {
-            $existing = $response.Content | ConvertFrom-Json
-            if ($existing.draft) {
+          if (-not $listed) { throw 'Nie udało się pobrać listy wydań z GitHub.' }
+          $matchingReleases = @($releaseListJson | ConvertFrom-Json | Where-Object { $_.tagName -ceq $env:RELEASE_TAG })
+          if ($matchingReleases.Count -gt 1) { throw "GitHub zwrócił więcej niż jedno wydanie dla tagu $env:RELEASE_TAG." }
+          if ($matchingReleases.Count -eq 1) {
+            $existing = $matchingReleases[0]
+            if ($existing.isDraft) {
               "already_published=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
               Write-Host "Ponowne użycie istniejącego szkicu wydania $env:RELEASE_TAG."
             }
@@ -149,9 +140,6 @@ jobs:
               Write-Host "Wydanie $env:RELEASE_TAG jest już publiczne; workflow tylko je ponownie zweryfikuje."
             }
             exit 0
-          }
-          if ($response.StatusCode -ne 404) {
-            throw "Nie można bezpiecznie ustalić, czy wydanie już istnieje (HTTP $($response.StatusCode))."
           }
 
           gh release create "$env:RELEASE_TAG" `
@@ -192,18 +180,20 @@ jobs:
           $verified = $false
           $lastReason = "Brak metadanych wydania."
           for ($attempt = 1; $attempt -le 12; $attempt++) {
-            $releaseJson = gh api "repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG" 2>$null
+            $releaseJson = gh release view "$env:RELEASE_TAG" `
+              --repo "${{ github.repository }}" `
+              --json tagName,isDraft,isPrerelease,assets 2>$null
             if ($LASTEXITCODE -eq 0) {
               $release = $releaseJson | ConvertFrom-Json
               $exeAssets = @($release.assets | Where-Object { $_.name -ceq 'KSeFMonitor.exe' -and $_.state -ceq 'uploaded' })
               $checksumAssets = @($release.assets | Where-Object { $_.name -ceq 'KSeFMonitor.exe.sha256' -and $_.state -ceq 'uploaded' })
-              if ($release.prerelease) {
+              if ($release.isPrerelease) {
                 $lastReason = "Wydanie jest oznaczone jako prerelease."
               }
               elseif (@($release.assets).Count -ne 2 -or $exeAssets.Count -ne 1 -or $checksumAssets.Count -ne 1) {
                 $lastReason = "Wydanie nie zawiera dokładnie dwóch oczekiwanych assetów."
               }
-              elseif ($release.tag_name -cne $env:RELEASE_TAG -or $exeAssets[0].size -ne $localExeSize -or $checksumAssets[0].size -ne $localChecksumSize) {
+              elseif ($release.tagName -cne $env:RELEASE_TAG -or $exeAssets[0].size -ne $localExeSize -or $checksumAssets[0].size -ne $localChecksumSize) {
                 $lastReason = "Tag lub rozmiary assetów nie zgadzają się z lokalnym wydaniem."
               }
               elseif ($exeAssets[0].digest -cne "sha256:$localExeHash") {
@@ -212,10 +202,10 @@ jobs:
               elseif ($checksumAssets[0].digest -cne "sha256:$localChecksumHash") {
                 $lastReason = "Digest pliku checksum nie zgadza się z lokalnym artefaktem."
               }
-              elseif ($env:ALREADY_PUBLISHED -eq 'true' -and $release.draft) {
+              elseif ($env:ALREADY_PUBLISHED -eq 'true' -and $release.isDraft) {
                 $lastReason = "Wcześniej opublikowane wydanie nie może być szkicem."
               }
-              elseif ($env:ALREADY_PUBLISHED -ne 'true' -and -not $release.draft) {
+              elseif ($env:ALREADY_PUBLISHED -ne 'true' -and -not $release.isDraft) {
                 $lastReason = "Nowe wydanie zostało opublikowane przed zakończeniem weryfikacji."
               }
               else {
@@ -233,12 +223,48 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $release = gh api "repos/${{ github.repository }}/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          $releaseJson = gh release view "$env:RELEASE_TAG" `
+            --repo "${{ github.repository }}" `
+            --json tagName,isDraft,isPrerelease
           if ($LASTEXITCODE -ne 0) { throw "Nie udało się ponownie odczytać wydania przed publikacją." }
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.tagName -cne $env:RELEASE_TAG) { throw "GitHub zwrócił wydanie dla innego tagu." }
 
           $newVersion = [version]$env:RELEASE_TAG.Substring(1)
-          $latestBeforeJson = gh api "repos/${{ github.repository }}/releases/latest" 2>$null
-          $latestBefore = if ($LASTEXITCODE -eq 0) { $latestBeforeJson | ConvertFrom-Json } else { $null }
+          $headers = @{
+            Accept = 'application/vnd.github+json'
+            Authorization = "Bearer $env:GH_TOKEN"
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $latestUri = "https://api.github.com/repos/${{ github.repository }}/releases/latest"
+          $latestResponse = $null
+          for ($attempt = 1; $attempt -le 6; $attempt++) {
+            try {
+              $latestResponse = Invoke-WebRequest -Uri $latestUri -Headers $headers -SkipHttpErrorCheck
+            }
+            catch {
+              if ($attempt -eq 6) { throw "Nie udało się sprawdzić najnowszego wydania: $($_.Exception.Message)" }
+              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
+              continue
+            }
+
+            if ($latestResponse.StatusCode -eq 200 -or $latestResponse.StatusCode -eq 404) { break }
+            if (($latestResponse.StatusCode -eq 429 -or $latestResponse.StatusCode -ge 500) -and $attempt -lt 6) {
+              Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20))
+              continue
+            }
+            throw "GitHub zwrócił HTTP $($latestResponse.StatusCode) podczas sprawdzania najnowszego wydania."
+          }
+          if ($null -eq $latestResponse) { throw 'GitHub nie zwrócił odpowiedzi podczas sprawdzania najnowszego wydania.' }
+          $latestBefore = if ($latestResponse.StatusCode -eq 200) {
+            $latestResponse.Content | ConvertFrom-Json
+          }
+          elseif ($latestResponse.StatusCode -eq 404) {
+            $null
+          }
+          else {
+            throw "Nie można bezpiecznie ustalić najnowszego wydania (HTTP $($latestResponse.StatusCode))."
+          }
           if ($null -ne $latestBefore -and $latestBefore.tag_name -match '^v\d+\.\d+\.\d+$') {
             $latestVersion = [version]$latestBefore.tag_name.Substring(1)
             if ($latestVersion -gt $newVersion) {
@@ -246,7 +272,7 @@ jobs:
             }
           }
 
-          if ($release.draft) {
+          if ($release.isDraft) {
             gh release edit "$env:RELEASE_TAG" `
               --repo "${{ github.repository }}" `
               --draft=false `
