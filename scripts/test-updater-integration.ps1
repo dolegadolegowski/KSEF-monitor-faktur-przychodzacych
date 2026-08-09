@@ -64,7 +64,6 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
     $backup = Join-Path $targetDirectory ".KSeFMonitor.exe.$nonce.bak"
     $failed = Join-Path $targetDirectory ".KSeFMonitor.exe.$nonce.failed"
     $descriptorPath = Join-Path $session 'update.json'
-    $helperPidPath = Join-Path $session 'helper.pid'
     $readyName = "Local\KSeFMonitor.Update.Ready.$nonce"
     $healthName = "Local\KSeFMonitor.Update.Health.$nonce"
 
@@ -96,7 +95,6 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
         CreatedUtc = [DateTimeOffset]::UtcNow.ToString('O')
         State = 'Verified'
     }
-    $descriptor | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
 
     $ready = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $readyName)
     $health = [System.Threading.EventWaitHandle]::new($false, [System.Threading.EventResetMode]::ManualReset, $healthName)
@@ -110,33 +108,36 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
         $start.ArgumentList.Add('-NonInteractive')
         $start.ArgumentList.Add('-File')
         $start.ArgumentList.Add($parentScript)
-        $start.ArgumentList.Add('-DescriptorPath')
-        $start.ArgumentList.Add($descriptorPath)
-        $start.ArgumentList.Add('-HelperPath')
-        $start.ArgumentList.Add($helper)
-        $start.ArgumentList.Add('-Nonce')
-        $start.ArgumentList.Add($nonce)
         $start.ArgumentList.Add('-ReadyEventName')
         $start.ArgumentList.Add($readyName)
-        $start.ArgumentList.Add('-HelperPidPath')
-        $start.ArgumentList.Add($helperPidPath)
         $parent = [System.Diagnostics.Process]::Start($start)
         if ($null -eq $parent) { throw 'Nie uruchomiono procesu nadrzędnego testu.' }
 
-        $pidDeadline = [DateTimeOffset]::UtcNow.AddSeconds(30)
-        while (-not (Test-Path -LiteralPath $helperPidPath)) {
-            if ([DateTimeOffset]::UtcNow -ge $pidDeadline) { throw 'Proces nadrzędny nie zapisał PID helpera.' }
-            Start-Sleep -Milliseconds 100
-        }
-        $helperPid = [int](Get-Content -LiteralPath $helperPidPath -Raw)
-        try {
-            $helperProcess = [System.Diagnostics.Process]::GetProcessById($helperPid)
-        }
-        catch {
-            throw "Helper o PID $helperPid zakończył się przed zgłoszeniem gotowości."
+        $descriptor.ParentProcessId = $parent.Id
+        $descriptor.ParentProcessStartUtcTicks = $parent.StartTime.ToUniversalTime().Ticks
+        $descriptor | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $descriptorPath -Encoding utf8NoBOM
+
+        $helperStart = [System.Diagnostics.ProcessStartInfo]::new($helper)
+        $helperStart.UseShellExecute = $false
+        $helperStart.CreateNoWindow = $true
+        $helperStart.WorkingDirectory = $targetDirectory
+        $helperStart.ArgumentList.Add('--update-helper')
+        $helperStart.ArgumentList.Add($descriptorPath)
+        $helperStart.ArgumentList.Add($nonce)
+        $helperProcess = [System.Diagnostics.Process]::Start($helperStart)
+        if ($null -eq $helperProcess) { throw 'Nie uruchomiono helpera aktualizacji.' }
+
+        $readyDeadline = [DateTimeOffset]::UtcNow.AddSeconds(130)
+        while (-not $ready.WaitOne(100)) {
+            if ($helperProcess.HasExited) {
+                $helperProcess.WaitForExit()
+                throw "Helper zakończył się przed zgłoszeniem gotowości z kodem $($helperProcess.ExitCode)."
+            }
+            if ([DateTimeOffset]::UtcNow -ge $readyDeadline) {
+                throw 'Helper nie zgłosił gotowości.'
+            }
         }
 
-        if (-not $ready.WaitOne([TimeSpan]::FromSeconds(130))) { throw 'Helper nie zgłosił gotowości.' }
         if (-not $parent.WaitForExit(10000)) {
             throw 'Proces nadrzędny testu nie zakończył się w ciągu 10 sekund.'
         }
@@ -147,6 +148,7 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
             $helperProcess.Kill($true)
             throw 'Helper aktualizacji nie zakończył się w limicie 180 sekund.'
         }
+        $helperProcess.WaitForExit()
 
         $expectedExit = if ($SuppressHealth) { 31 } else { 0 }
         if ($helperProcess.ExitCode -ne $expectedExit) {
@@ -168,13 +170,20 @@ function Invoke-UpdateScenario([string]$Name, [bool]$SuppressHealth) {
         }
     }
     finally {
+        if ($null -ne $helperProcess -and -not $helperProcess.HasExited) {
+            $helperProcess.Kill($true)
+            $helperProcess.WaitForExit(10000) | Out-Null
+        }
+        if ($null -ne $parent) {
+            if (-not $parent.HasExited) {
+                $parent.Kill($true)
+                $parent.WaitForExit(10000) | Out-Null
+            }
+        }
+        if ($null -ne $helperProcess) { $helperProcess.Dispose() }
+        if ($null -ne $parent) { $parent.Dispose() }
         $ready.Dispose()
         $health.Dispose()
-        if ($null -ne $helperProcess) { $helperProcess.Dispose() }
-        if ($null -ne $parent) {
-            if (-not $parent.HasExited) { $parent.Kill($true) }
-            $parent.Dispose()
-        }
         Start-Sleep -Milliseconds 500
         Stop-ProcessesFromPath $target
         Stop-ProcessesFromPath $helper
