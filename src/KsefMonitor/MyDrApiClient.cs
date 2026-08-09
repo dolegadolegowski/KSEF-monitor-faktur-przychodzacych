@@ -65,7 +65,7 @@ internal sealed class MyDrApiClient : IDisposable
             BaseAddress = ProductionBaseUri,
             Timeout = TimeSpan.FromSeconds(60)
         };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd("KSeFMonitor/0.5.2 (Windows 11)");
+        _http.DefaultRequestHeaders.UserAgent.ParseAdd(ProductInformation.UserAgent);
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 

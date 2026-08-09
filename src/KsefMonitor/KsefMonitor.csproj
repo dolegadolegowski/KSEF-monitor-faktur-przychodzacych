@@ -12,7 +12,10 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets/KSeFMonitor.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>0.5.2</Version>
+    <Version>0.6.0</Version>
+    <AssemblyVersion>0.6.0.0</AssemblyVersion>
+    <FileVersion>0.6.0.0</FileVersion>
+    <InformationalVersion>0.6.0</InformationalVersion>
     <Authors>KSeF Monitor</Authors>
     <RepositoryUrl>https://github.com/dolegadolegowski/KSEF-monitor-faktur-przychodzacych</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

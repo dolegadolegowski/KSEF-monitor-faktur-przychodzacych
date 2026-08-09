@@ -25,6 +25,7 @@ internal static class AppPaths
     public static string MyDrCredentialsFile => Path.Combine(Root, "mydr-credentials.dat");
     public static string MyDrStateFile => Path.Combine(Root, "mydr-state.dat");
     public static string LogFile => Path.Combine(Root, "app.log");
+    public static string UpdateFailureFile => Path.Combine(Root, "update-failure.txt");
 
     public static void EnsureCreated()
     {

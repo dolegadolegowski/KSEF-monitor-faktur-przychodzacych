@@ -59,6 +59,23 @@ Require(!NipValidator.IsValid("ABC5265877635"), "Walidacja zaakceptowała niedoz
 Require(AppSettings.GetBaseUri() == new Uri("https://api.ksef.mf.gov.pl/v2/"), "Aplikacja nie używa produkcyjnego endpointu KSeF.");
 await TestKsefProtocolAsync();
 await TestMyDrProtocolAsync();
+await UpdaterSmokeTests.RunAsync(Require);
+if (args.Contains("--live-github", StringComparer.Ordinal))
+{
+    var expectedTagIndex = Array.IndexOf(args, "--expected-tag");
+    Require(expectedTagIndex >= 0 && expectedTagIndex + 1 < args.Length,
+        "Opcja --live-github wymaga --expected-tag vMAJOR.MINOR.PATCH.");
+    await UpdaterSmokeTests.RunLiveGitHubCheckAsync(args[expectedTagIndex + 1], Require);
+}
+var publishedExeIndex = Array.IndexOf(args, "--published-exe");
+var expectedVersionIndex = Array.IndexOf(args, "--expected-version");
+if (publishedExeIndex >= 0 || expectedVersionIndex >= 0)
+{
+    Require(publishedExeIndex >= 0 && publishedExeIndex + 1 < args.Length &&
+            expectedVersionIndex >= 0 && expectedVersionIndex + 1 < args.Length,
+        "Opcje kontroli EXE wymagają --published-exe PATH i --expected-version VERSION.");
+    UpdaterSmokeTests.CheckPublishedExecutable(args[publishedExeIndex + 1], args[expectedVersionIndex + 1], Require);
+}
 
 Console.WriteLine("KSeFMonitor smoke tests: OK");
 return 0;
