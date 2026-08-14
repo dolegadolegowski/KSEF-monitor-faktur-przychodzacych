@@ -51,6 +51,7 @@ internal static class UpdateInstaller
     private static readonly TimeSpan HealthySessionRetention = TimeSpan.FromDays(14);
     private static readonly TimeSpan RolledBackSessionRetention = TimeSpan.FromDays(2);
     private static readonly TimeSpan AbandonedSessionRetention = TimeSpan.FromDays(7);
+    private static readonly char[] FileVersionSeparators = [' ', '+', '-'];
     private static readonly JsonSerializerOptions DescriptorJsonOptions = new()
     {
         WriteIndented = true,
@@ -1019,7 +1020,7 @@ internal static class UpdateInstaller
     {
         version = default;
         if (string.IsNullOrWhiteSpace(value)) return false;
-        var numeric = value.Split(new[] { ' ', '+', '-' }, 2, StringSplitOptions.RemoveEmptyEntries)[0];
+        var numeric = value.Split(FileVersionSeparators, 2, StringSplitOptions.RemoveEmptyEntries)[0];
         if (!Version.TryParse(numeric, out var parsed)) return false;
         version = SemanticVersion.FromAssemblyVersion(parsed);
         return true;

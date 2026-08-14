@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -12,6 +12,9 @@ namespace KsefMonitor;
 internal sealed class MyDrSynchronizationService : IDisposable
 {
     private static readonly TimeSpan BusyRetryInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan UnexpectedFailureRetryInterval = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MaximumTimerDue = TimeSpan.FromDays(30);
+    private const int CacheCheckpointServiceRequests = 25;
     private readonly AppStore _store;
     private readonly ApplicationLog _log;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
@@ -30,6 +33,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
     private int _isConfigured;
     private int _isSynchronizing;
     private int _activeOperations;
+    private long _timerGeneration;
     private int _disposed;
     private int _disposeSetupCompleted;
     private int _primitivesDisposed;
@@ -46,12 +50,17 @@ internal sealed class MyDrSynchronizationService : IDisposable
         var connectionId = _credentials is { IsConfigured: true }
             ? _credentials.ConnectionId
             : Guid.Empty;
-        if (_state.ConnectionId != connectionId)
+        var connectionChanged = _state.BindToConnection(connectionId);
+        var schemaUpgraded = _state.UpgradeDoctorTurnoverSchema();
+        // Brak poświadczeń zawsze czyści też historyczny .bak. W wersji 0.6
+        // pusty plik główny mógł nadal mieć kopię danych poprzedniego konta.
+        var recoveryCopiesMustBeScrubbed = connectionId == Guid.Empty;
+        if (connectionChanged || schemaUpgraded || recoveryCopiesMustBeScrubbed)
         {
-            _state.BindToConnection(connectionId);
             try
             {
-                _store.SaveMyDrState(_state);
+                if (connectionChanged || recoveryCopiesMustBeScrubbed) _store.ReplaceMyDrState(_state);
+                else _store.SaveMyDrState(_state);
             }
             catch (Exception exception)
             {
@@ -137,7 +146,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
         {
             lock (_lifecycleGate) _syncGate.Release();
             CompleteOperation();
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            RaiseStateChanged();
             if (!IsDisposed && (restartScheduler || !completed)) Start();
         }
     }
@@ -159,8 +168,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 var connectionId = loaded is { IsConfigured: true } ? loaded.ConnectionId : Guid.Empty;
                 lock (_stateGate)
                 {
-                    _state.BindToConnection(connectionId);
-                    _store.SaveMyDrState(_state);
+                    if (_state.BindToConnection(connectionId)) _store.ReplaceMyDrState(_state);
                 }
             }
         }
@@ -174,6 +182,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
 
     private async void TimerElapsed(object? state)
     {
+        if (state is not long generation || !TryConsumeTimer(generation)) return;
         try
         {
             await SynchronizeAsync(manual: false, _shutdownToken).ConfigureAwait(false);
@@ -181,6 +190,12 @@ internal sealed class MyDrSynchronizationService : IDisposable
         catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested)
         {
             // Zamykanie aplikacji.
+        }
+        catch (Exception exception)
+        {
+            _log.Error("MyDR", "Nieoczekiwany błąd automatycznej synchronizacji MyDR.", exception);
+            SetStatus("Nie udało się odświeżyć MyDR. Aplikacja spróbuje ponownie później.", StatusSeverity.Error);
+            if (!IsDisposed) Schedule(UnexpectedFailureRetryInterval);
         }
     }
 
@@ -213,10 +228,13 @@ internal sealed class MyDrSynchronizationService : IDisposable
         }
 
         CancelTimerWithoutNotification();
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
         var configurationVersionAtStart = -1;
         var configurationToken = CancellationToken.None;
         CancellationTokenSource? linkedConfiguration = null;
+        Dictionary<long, MyDrCachedVisit>? partialVisitCache = null;
+        var checkpointedVisitCount = 0;
+        var finalSnapshotCommitted = false;
         try
         {
             MyDrCredentials credentials;
@@ -248,6 +266,28 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 _store.SaveMyDrState(_state);
             }, syncToken);
 
+            var apiRetryAt = WithCurrentState(configurationVersionAtStart, () =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (_state.ApiBlockedUntilUtc is not { } blockedUntil) return (DateTimeOffset?)null;
+                if (blockedUntil > now) return blockedUntil;
+                _state.ApiBlockedUntilUtc = null;
+                _store.SaveMyDrState(_state);
+                return null;
+            }, syncToken);
+            if (apiRetryAt is { } retryAt)
+            {
+                var message = $"MyDR poprosił o przerwę w wysyłaniu zapytań. Spróbuj ponownie po {retryAt.ToLocalTime():HH:mm}.";
+                TryRecordError(configurationVersionAtStart, message);
+                SetStatus(message, StatusSeverity.Error);
+                if (manual)
+                    throw new MyDrApiException(
+                        message,
+                        HttpStatusCode.TooManyRequests,
+                        retryAfter: retryAt - DateTimeOffset.UtcNow);
+                return;
+            }
+
             _log.Info("MyDR", manual
                 ? "Rozpoczęto wymuszone odświeżanie obrotu MyDR."
                 : "Rozpoczęto dzienne odświeżanie obrotu MyDR.");
@@ -266,21 +306,17 @@ internal sealed class MyDrSynchronizationService : IDisposable
             var firstVisibleMonth = currentMonth.AddMonths(-SynchronizationService.VisibleHistoryMonthsBack);
             var lastVisibleDate = currentMonth.AddMonths(1).AddDays(-1);
             var allVisits = new Dictionary<long, MyDrVisit>();
-
-            for (var offset = 0; offset <= SynchronizationService.VisibleHistoryMonthsBack; offset++)
-            {
-                var month = firstVisibleMonth.AddMonths(offset);
-                var lastDay = month.AddMonths(1).AddDays(-1);
-                SetStatus($"Pobieranie obrotu MyDR: {month.ToString("MM.yyyy", CultureInfo.InvariantCulture)}…");
-                var visits = await client.GetPrivateVisitsAsync(month, lastDay, syncToken).ConfigureAwait(false);
-                foreach (var visit in visits)
-                    if (!allVisits.TryAdd(visit.Id, visit))
-                        throw new MyDrApiException("MyDR zwrócił tę samą wizytę w więcej niż jednym miesiącu.");
-            }
+            SetStatus($"Pobieranie obrotu MyDR: {firstVisibleMonth:MM.yyyy}–{lastVisibleDate:MM.yyyy}…");
+            var visits = await client.GetPrivateVisitsAsync(firstVisibleMonth, lastVisibleDate, syncToken)
+                .ConfigureAwait(false);
+            foreach (var visit in visits)
+                if (!allVisits.TryAdd(visit.Id, visit))
+                    throw new MyDrApiException("MyDR zwrócił tę samą wizytę więcej niż jeden raz.");
 
             var oldCache = WithCurrentState(configurationVersionAtStart, () =>
                 _state.Visits.ToDictionary(pair => pair.Key, pair => pair.Value.Snapshot()), syncToken);
             var newCache = new Dictionary<long, MyDrCachedVisit>();
+            partialVisitCache = newCache;
             var performedVisits = allVisits.Values
                 .Where(visit => visit.IsPerformed)
                 .Select(visit => (Visit: visit, Date: visit.GetDate()))
@@ -288,6 +324,11 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 .OrderBy(item => item.Date)
                 .ThenBy(item => item.Visit.Id)
                 .ToList();
+            if (performedVisits.Any(item => item.Visit.DoctorId is null or <= 0))
+                throw new MyDrApiException("MyDR zwrócił wykonaną wizytę bez przypisanej osoby realizującej.");
+            var serviceRequestCount = 0;
+            var serviceCacheHitCount = 0;
+            var lastCheckpointRequestCount = 0;
 
             for (var index = 0; index < performedVisits.Count; index++)
             {
@@ -295,21 +336,17 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 var item = performedVisits[index];
                 var state = item.Visit.State?.Trim() ?? string.Empty;
                 MyDrCachedVisit cached;
-                var isCurrentMonth = item.Date.Year == currentMonth.Year && item.Date.Month == currentMonth.Month;
-                if (!manual &&
-                    !isCurrentMonth &&
-                    !string.IsNullOrWhiteSpace(item.Visit.LatestModification) &&
-                    oldCache.TryGetValue(item.Visit.Id, out var existing) &&
-                    existing.VisitDate == item.Date &&
-                    string.Equals(existing.State, state, StringComparison.Ordinal) &&
-                    string.Equals(existing.LatestModification, item.Visit.LatestModification, StringComparison.Ordinal))
+                oldCache.TryGetValue(item.Visit.Id, out var existing);
+                if (MyDrVisitCachePolicy.CanReuse(item.Visit, item.Date, existing, forceRefresh: manual))
                 {
-                    cached = existing.Snapshot();
+                    cached = existing!.Snapshot();
+                    serviceCacheHitCount++;
                 }
                 else
                 {
                     SetStatus($"Obliczanie obrotu MyDR: {index + 1}/{performedVisits.Count}…");
                     var services = await client.GetVisitServicesAsync(item.Visit.Id, syncToken).ConfigureAwait(false);
+                    serviceRequestCount++;
                     decimal gross = 0;
                     checked
                     {
@@ -328,25 +365,30 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 }
 
                 newCache[item.Visit.Id] = cached;
+                if (serviceRequestCount - lastCheckpointRequestCount >= CacheCheckpointServiceRequests)
+                {
+                    SaveVisitCacheCheckpoint(configurationVersionAtStart, newCache, syncToken);
+                    lastCheckpointRequestCount = serviceRequestCount;
+                    checkpointedVisitCount = newCache.Count;
+                }
             }
 
             var completedAtUtc = DateTimeOffset.UtcNow;
             var summaries = new Dictionary<string, MyDrMonthSummary>(StringComparer.Ordinal);
+            var turnoverSources = performedVisits.Select(item => new MyDrPerformedVisitTurnover(
+                    item.Visit,
+                    item.Date,
+                    newCache[item.Visit.Id]))
+                .ToList();
             for (var offset = 0; offset <= SynchronizationService.VisibleHistoryMonthsBack; offset++)
             {
                 var month = firstVisibleMonth.AddMonths(offset);
-                var monthVisits = newCache.Values
-                    .Where(visit => visit.VisitDate.Year == month.Year && visit.VisitDate.Month == month.Month)
-                    .ToList();
-                summaries[MyDrMonthKey.Create(month.Year, month.Month)] = new MyDrMonthSummary
-                {
-                    Year = month.Year,
-                    Month = month.Month,
-                    GrossAmount = monthVisits.Sum(visit => visit.GrossAmount),
-                    VisitCount = monthVisits.Count,
-                    ServiceCount = monthVisits.Sum(visit => visit.ServiceCount),
-                    UpdatedAtUtc = completedAtUtc
-                };
+                summaries[MyDrMonthKey.Create(month.Year, month.Month)] =
+                    MyDrMonthSummaryCalculator.Calculate(
+                        month.Year,
+                        month.Month,
+                        completedAtUtc,
+                        turnoverSources);
             }
 
             WithCurrentState(configurationVersionAtStart, () =>
@@ -355,6 +397,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 candidate.Visits = newCache;
                 candidate.Months = summaries;
                 candidate.LastSuccessfulSyncUtc = completedAtUtc;
+                candidate.ApiBlockedUntilUtc = null;
                 candidate.LastError = string.Empty;
                 _store.SaveMyDrState(candidate);
 
@@ -363,10 +406,12 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 _state.Visits = candidate.Visits;
                 _state.Months = candidate.Months;
                 _state.LastSuccessfulSyncUtc = candidate.LastSuccessfulSyncUtc;
+                _state.ApiBlockedUntilUtc = candidate.ApiBlockedUntilUtc;
                 _state.LastError = candidate.LastError;
             }, syncToken);
+            finalSnapshotCommitted = true;
 
-            _log.Info("MyDR", $"Zakończono odświeżanie obrotu. Wizyty: {newCache.Count}; miesiące: {summaries.Count}.");
+            _log.Info("MyDR", $"Zakończono odświeżanie obrotu. Wizyty: {newCache.Count}; miesiące: {summaries.Count}; zapytania o usługi: {serviceRequestCount}; trafienia cache: {serviceCacheHitCount}.");
             SetStatus($"Obrót MyDR odświeżono o {DateTime.Now:HH:mm}.");
         }
         catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested || cancellationToken.IsCancellationRequested)
@@ -383,12 +428,19 @@ internal sealed class MyDrSynchronizationService : IDisposable
         {
             var message = UserFacingErrors.ForMyDrSynchronization(exception);
             _log.Error("MyDR", "Nie udało się odświeżyć miesięcznego obrotu.", exception);
+            if (exception is MyDrApiException apiException &&
+                (apiException.StatusCode == HttpStatusCode.TooManyRequests ||
+                 apiException.RetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero))
+                RecordApiBlock(configurationVersionAtStart, apiException.RetryAfter);
             TryRecordError(configurationVersionAtStart, message);
             SetStatus(message, StatusSeverity.Error);
             if (manual) throw;
         }
         finally
         {
+            if (!finalSnapshotCommitted && partialVisitCache is { Count: > 0 } partial &&
+                partial.Count > checkpointedVisitCount)
+                TrySaveVisitCacheCheckpoint(configurationVersionAtStart, partial);
             linkedConfiguration?.Dispose();
             lock (_lifecycleGate)
             {
@@ -396,8 +448,8 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 _syncGate.Release();
             }
 
-            StateChanged?.Invoke(this, EventArgs.Empty);
             CompleteOperation();
+            RaiseStateChanged();
             if (!IsDisposed) Start();
         }
     }
@@ -480,6 +532,72 @@ internal sealed class MyDrSynchronizationService : IDisposable
         }
     }
 
+    private void RecordApiBlock(int configurationVersion, TimeSpan? retryAfter)
+    {
+        try
+        {
+            if (configurationVersion < 0) return;
+            var delay = retryAfter is { } serverDelay && serverDelay > TimeSpan.Zero
+                ? serverDelay
+                : TimeSpan.FromMinutes(15);
+            var blockedUntilUtc = DateTimeOffset.UtcNow + delay;
+            lock (_configurationGate)
+            {
+                if (configurationVersion != _configurationVersion) return;
+                lock (_stateGate)
+                {
+                    if (_state.ApiBlockedUntilUtc is null || blockedUntilUtc > _state.ApiBlockedUntilUtc)
+                    {
+                        _state.ApiBlockedUntilUtc = blockedUntilUtc;
+                        _store.SaveMyDrState(_state);
+                    }
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            _log.Error("MyDR", "Nie udało się zapisać czasu blokady API MyDR.", exception);
+        }
+    }
+
+    private void SaveVisitCacheCheckpoint(
+        int configurationVersion,
+        IReadOnlyDictionary<long, MyDrCachedVisit> completedVisits,
+        CancellationToken cancellationToken)
+    {
+        WithCurrentState(configurationVersion, () =>
+        {
+            var candidate = _state.Snapshot();
+            foreach (var pair in completedVisits)
+                candidate.Visits[pair.Key] = pair.Value.Snapshot();
+            _store.SaveMyDrState(candidate);
+
+            // Podsumowania pozostają ostatnią kompletną migawką. Aktualizujemy
+            // wyłącznie techniczny cache, aby po 429, błędzie sieci lub zamknięciu
+            // nie pobierać ponownie usług już poprawnie przeliczonych w tej próbie.
+            foreach (var pair in completedVisits)
+                _state.Visits[pair.Key] = pair.Value.Snapshot();
+        }, cancellationToken);
+    }
+
+    private void TrySaveVisitCacheCheckpoint(
+        int configurationVersion,
+        IReadOnlyDictionary<long, MyDrCachedVisit> completedVisits)
+    {
+        try
+        {
+            SaveVisitCacheCheckpoint(configurationVersion, completedVisits, CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (ConfigurationHasChanged(configurationVersion) || IsDisposed)
+        {
+            // Nie wolno zapisać cache poprzedniego konta po zmianie konfiguracji.
+        }
+        catch (Exception exception)
+        {
+            _log.Warning("MyDR", "Nie udało się zapisać częściowego postępu cache MyDR.", exception);
+        }
+    }
+
     private void ScheduleNextAutomaticCheck()
     {
         DateOnly? lastCheck;
@@ -500,6 +618,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
         if (IsDisposed || _shutdownToken.IsCancellationRequested || !IsConfigured) return;
         var due = nextUtc - DateTimeOffset.UtcNow;
         if (due < TimeSpan.Zero) due = TimeSpan.Zero;
+        if (due > MaximumTimerDue) due = MaximumTimerDue;
         lock (_scheduleGate)
         {
             if (IsDisposed ||
@@ -508,26 +627,41 @@ internal sealed class MyDrSynchronizationService : IDisposable
                 configurationVersion != Volatile.Read(ref _configurationVersion))
                 return;
 
-            _nextScheduledSyncUtc = nextUtc;
+            _nextScheduledSyncUtc = DateTimeOffset.UtcNow + due;
             _timer?.Dispose();
-            _timer = new Timer(TimerElapsed, null, due, Timeout.InfiniteTimeSpan);
+            var generation = ++_timerGeneration;
+            _timer = new Timer(TimerElapsed, generation, due, Timeout.InfiniteTimeSpan);
         }
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
     }
 
     private void CancelScheduledSync()
     {
         CancelTimerWithoutNotification();
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
     }
 
     private void CancelTimerWithoutNotification()
     {
         lock (_scheduleGate)
         {
+            _timerGeneration++;
             _nextScheduledSyncUtc = null;
             _timer?.Dispose();
             _timer = null;
+        }
+    }
+
+    private bool TryConsumeTimer(long generation)
+    {
+        lock (_scheduleGate)
+        {
+            if (generation != _timerGeneration || IsDisposed) return false;
+            _timerGeneration++;
+            _nextScheduledSyncUtc = null;
+            _timer?.Dispose();
+            _timer = null;
+            return true;
         }
     }
 
@@ -543,8 +677,40 @@ internal sealed class MyDrSynchronizationService : IDisposable
         lock (_configurationGate) return version != _configurationVersion;
     }
 
-    private void SetStatus(string text, StatusSeverity severity = StatusSeverity.Information) =>
-        StatusChanged?.Invoke(this, new AppStatusMessage(text, severity));
+    private void RaiseStateChanged()
+    {
+        var handlers = StateChanged;
+        if (handlers is null) return;
+        foreach (EventHandler handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, EventArgs.Empty);
+            }
+            catch (Exception exception)
+            {
+                _log.Warning("Interfejs", "Odbiorca zmiany stanu synchronizacji MyDR zgłosił błąd.", exception);
+            }
+        }
+    }
+
+    private void SetStatus(string text, StatusSeverity severity = StatusSeverity.Information)
+    {
+        var handlers = StatusChanged;
+        if (handlers is null) return;
+        var message = new AppStatusMessage(text, severity);
+        foreach (EventHandler<AppStatusMessage> handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, message);
+            }
+            catch (Exception exception)
+            {
+                _log.Warning("Interfejs", "Odbiorca komunikatu synchronizacji MyDR zgłosił błąd.", exception);
+            }
+        }
+    }
 
     private void CompleteOperation()
     {

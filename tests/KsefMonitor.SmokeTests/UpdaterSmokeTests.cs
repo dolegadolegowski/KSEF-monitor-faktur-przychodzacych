@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -14,6 +15,9 @@ namespace KsefMonitor;
 
 internal static class UpdaterSmokeTests
 {
+    private static readonly string[] InvalidPostUpdateArguments = { "--post-update", "update.json", "../nonce" };
+    private static readonly string[] IncompleteHelperArguments = { "--update-helper", "update.json" };
+
     public static async Task RunAsync(Action<bool, string> require)
     {
         TestSemanticVersions(require);
@@ -154,7 +158,8 @@ internal static class UpdaterSmokeTests
     {
         var hash = new string('A', 64);
         var valid = Encoding.ASCII.GetBytes($"{hash}  {ProductInformation.WindowsReleaseAssetName}\r\n");
-        require(ReleaseChecksumParser.Parse(valid) == hash.ToLowerInvariant(), "Parser sumy SHA-256 nie normalizuje poprawnego pliku.");
+        require(string.Equals(ReleaseChecksumParser.Parse(valid), hash.ToLowerInvariant(), StringComparison.Ordinal),
+            "Parser sumy SHA-256 nie normalizuje poprawnego pliku.");
         foreach (var invalid in new[]
                  {
                      $"{hash} {ProductInformation.WindowsReleaseAssetName}\n",
@@ -295,7 +300,8 @@ internal static class UpdaterSmokeTests
                 log,
                 client,
                 processPath: Path.Combine(directory, ProductInformation.WindowsReleaseAssetName),
-                currentVersion: new SemanticVersion(0, 6, 0));
+                currentVersion: new SemanticVersion(0, 6, 0),
+                forcedCheckMinimumInterval: TimeSpan.Zero);
             service.StateChanged += (_, _) => throw new InvalidOperationException("Kontrolowany błąd odbiorcy testowego.");
 
             var first = service.CheckForUpdatesAsync(force: true);
@@ -322,6 +328,55 @@ internal static class UpdaterSmokeTests
             require(requestCount == 3 && failedRefresh.Phase == AppUpdatePhase.Available &&
                     failedRefresh.HasAvailableUpdate && failedRefresh.HasError,
                 "AppUpdateService nie zachował wersji lub nie oznaczył błędu ostatniego ponownego sprawdzenia.");
+
+            var cooldownRequests = 0;
+            using var cooldownHandler = new UpdateTestHandler((_, _) =>
+            {
+                cooldownRequests++;
+                return Task.FromResult(Json(CreateReleaseJson("v0.6.1", executable, checksum)));
+            });
+            using var cooldownClient = new GitHubUpdateClient(cooldownHandler);
+            using var cooldownService = new AppUpdateService(
+                log,
+                cooldownClient,
+                currentVersion: new SemanticVersion(0, 6, 0),
+                forcedCheckMinimumInterval: TimeSpan.FromMinutes(1));
+            await cooldownService.CheckForUpdatesAsync(force: true);
+            await cooldownService.CheckForUpdatesAsync(force: true);
+            require(cooldownRequests == 1,
+                "Ręczne sprawdzanie aktualizacji może wykonywać seryjne żądania do GitHub API.");
+
+            foreach (var statusCode in new[]
+                     {
+                         HttpStatusCode.TooManyRequests,
+                         HttpStatusCode.Forbidden,
+                         HttpStatusCode.ServiceUnavailable
+                     })
+            {
+                var rateLimitRequests = 0;
+                using var rateLimitHandler = new UpdateTestHandler((_, _) =>
+                {
+                    rateLimitRequests++;
+                    var response = new HttpResponseMessage(statusCode);
+                    if (statusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.ServiceUnavailable)
+                        response.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(TimeSpan.FromMinutes(30));
+                    else
+                        response.Headers.TryAddWithoutValidation(
+                            "X-RateLimit-Reset",
+                            DateTimeOffset.UtcNow.AddMinutes(30).ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture));
+                    return Task.FromResult(response);
+                });
+                using var rateLimitClient = new GitHubUpdateClient(rateLimitHandler);
+                using var rateLimitService = new AppUpdateService(
+                    log,
+                    rateLimitClient,
+                    currentVersion: new SemanticVersion(0, 6, 0),
+                    forcedCheckMinimumInterval: TimeSpan.Zero);
+                var limited = await rateLimitService.CheckForUpdatesAsync(force: true);
+                var stillLimited = await rateLimitService.CheckForUpdatesAsync(force: true);
+                require(rateLimitRequests == 1 && limited.HasError && stillLimited.HasError,
+                    $"AppUpdateService nie respektuje blokady GitHub po HTTP {(int)statusCode}.");
+            }
         }
         finally
         {
@@ -395,9 +450,9 @@ internal static class UpdaterSmokeTests
             require(acceptedMissingDescriptor && invocation is not null,
                 "Przenośny test składni nie rozpoznaje poprawnych argumentów startu po aktualizacji.");
         }
-        require(!UpdateInstaller.TryParsePostUpdateInvocation(new[] { "--post-update", "update.json", "../nonce" }, out _),
+        require(!UpdateInstaller.TryParsePostUpdateInvocation(InvalidPostUpdateArguments, out _),
             "Updater zaakceptował niepoprawny nonce.");
-        require(!UpdateInstaller.IsHelperInvocation(new[] { "--update-helper", "update.json" }),
+        require(!UpdateInstaller.IsHelperInvocation(IncompleteHelperArguments),
             "Updater zaakceptował niepełne argumenty helpera.");
     }
 

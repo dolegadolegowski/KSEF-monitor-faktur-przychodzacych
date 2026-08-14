@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Text.Json.Serialization;
 
 namespace KsefMonitor;
@@ -27,7 +28,9 @@ internal sealed class AppState
     public DateTimeOffset? LastSuccessfulSyncUtc { get; set; }
     public DateTimeOffset? LastMetadataSyncAttemptUtc { get; set; }
     public DateTimeOffset? PermanentStorageHwmDate { get; set; }
+    public DateTimeOffset? ApiBlockedUntilUtc { get; set; }
     public DateTimeOffset? InvoiceDownloadBlockedUntilUtc { get; set; }
+    public DateTimeOffset? LastInvoiceDownloadAttemptUtc { get; set; }
     public List<DateTimeOffset> InvoiceDownloadAttemptsUtc { get; set; } = new();
     public Dictionary<string, StoredInvoice> Invoices { get; set; } = new(StringComparer.Ordinal);
 
@@ -51,8 +54,9 @@ internal sealed class AppState
         InvoiceDownloadBlockedUntilUtc = null;
         HistoricalBackfillBeforeIssueDate = null;
         Invoices.Clear();
-        // Limit pobrań jest liczony dla API i użytkownika, dlatego zachowujemy
-        // historię prób również po zmianie kontekstu.
+        // Globalny Retry-After oraz limity są ochroną endpointu/IP. Zachowujemy je
+        // także po zmianie NIP-u, aby zapis ustawień nie omijał blokady otrzymanej
+        // podczas testowania nowego kontekstu.
         return true;
     }
 
@@ -64,7 +68,9 @@ internal sealed class AppState
         LastSuccessfulSyncUtc = LastSuccessfulSyncUtc,
         LastMetadataSyncAttemptUtc = LastMetadataSyncAttemptUtc,
         PermanentStorageHwmDate = PermanentStorageHwmDate,
+        ApiBlockedUntilUtc = ApiBlockedUntilUtc,
         InvoiceDownloadBlockedUntilUtc = InvoiceDownloadBlockedUntilUtc,
+        LastInvoiceDownloadAttemptUtc = LastInvoiceDownloadAttemptUtc,
         InvoiceDownloadAttemptsUtc = new List<DateTimeOffset>(InvoiceDownloadAttemptsUtc),
         Invoices = Invoices.ToDictionary(
             pair => pair.Key,
@@ -111,6 +117,8 @@ internal sealed class StoredInvoice
     public bool HasAttachment { get; set; }
     public bool IsSelfInvoicing { get; set; }
     public string? Xml { get; set; }
+    public int XmlDownloadFailureCount { get; set; }
+    public DateTimeOffset? NextXmlDownloadAttemptUtc { get; set; }
     public DateTimeOffset DiscoveredAtUtc { get; set; }
     public DateTimeOffset? ViewedAtUtc { get; set; }
     public DateTimeOffset? NotifiedAtUtc { get; set; }
@@ -161,6 +169,8 @@ internal sealed class StoredInvoice
         HasAttachment = HasAttachment,
         IsSelfInvoicing = IsSelfInvoicing,
         Xml = Xml,
+        XmlDownloadFailureCount = XmlDownloadFailureCount,
+        NextXmlDownloadAttemptUtc = NextXmlDownloadAttemptUtc,
         DiscoveredAtUtc = DiscoveredAtUtc,
         ViewedAtUtc = ViewedAtUtc,
         NotifiedAtUtc = NotifiedAtUtc
@@ -178,6 +188,64 @@ internal sealed class StoredInvoice
         InvoiceType ??= string.Empty;
         FormCode ??= string.Empty;
         InvoicingMode ??= string.Empty;
+        if (XmlDownloadFailureCount < 0) XmlDownloadFailureCount = 0;
+        if (!string.IsNullOrWhiteSpace(Xml))
+        {
+            XmlDownloadFailureCount = 0;
+            NextXmlDownloadAttemptUtc = null;
+        }
+    }
+}
+
+internal static class KsefXmlDownloadPolicy
+{
+    private static readonly TimeSpan MinimumRetryDelay = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan MaximumDocumentRetryDelay = TimeSpan.FromHours(24);
+
+    public static bool ShouldStopQueue(HttpStatusCode? statusCode) =>
+        statusCode is HttpStatusCode.Unauthorized or
+            HttpStatusCode.Forbidden or
+            HttpStatusCode.RequestTimeout or
+            HttpStatusCode.TooManyRequests ||
+        statusCode is { } status && (int)status >= 500;
+
+    public static IReadOnlyList<StoredInvoice> SelectPending(
+        IEnumerable<StoredInvoice> invoices,
+        DateTimeOffset now,
+        int maximumCount)
+    {
+        ArgumentNullException.ThrowIfNull(invoices);
+        if (maximumCount <= 0) return Array.Empty<StoredInvoice>();
+
+        return invoices
+            .Where(invoice => string.IsNullOrWhiteSpace(invoice.Xml) &&
+                              (invoice.NextXmlDownloadAttemptUtc is null ||
+                               invoice.NextXmlDownloadAttemptUtc <= now))
+            .OrderByDescending(invoice => invoice.IsNew)
+            .ThenBy(invoice => invoice.DiscoveredAtUtc)
+            .Take(maximumCount)
+            .ToList();
+    }
+
+    public static TimeSpan GetRetryDelay(
+        int failureCount,
+        HttpStatusCode? statusCode,
+        TimeSpan? serverRetryAfter = null)
+    {
+        var serverDelay = serverRetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero
+            ? retryAfter
+            : TimeSpan.Zero;
+
+        // Błędy dokumentu (np. 400/404 zanim XML zostanie zmaterializowany)
+        // dostają wykładniczy backoff: 15 min, 1 h, 4 h, 16 h, maks. 24 h.
+        // Dla awarii systemowej kolejka jest zatrzymywana osobno, dlatego
+        // wystarczy co najmniej standardowy interwał synchronizacji.
+        var exponent = statusCode is HttpStatusCode.BadRequest or HttpStatusCode.NotFound
+            ? Math.Clamp(failureCount - 1, 0, 4)
+            : 0;
+        var calculated = TimeSpan.FromTicks(MinimumRetryDelay.Ticks * (1L << (2 * exponent)));
+        if (calculated > MaximumDocumentRetryDelay) calculated = MaximumDocumentRetryDelay;
+        return serverDelay > calculated ? serverDelay : calculated;
     }
 }
 

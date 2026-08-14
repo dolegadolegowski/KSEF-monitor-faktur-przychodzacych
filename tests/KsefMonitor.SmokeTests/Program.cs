@@ -52,6 +52,9 @@ TestStatusBanner();
 TestUserFacingErrors();
 TestApplicationLog();
 TestMyDrStateAndSchedule();
+TestMyDrDoctorTurnovers();
+TestApiTrafficPolicies();
+TestAtomicMyDrStateReplacement();
 Require(NipValidator.IsValid("526-587-76-35"), "Walidacja poprawnego NIP-u nie działa.");
 Require(!NipValidator.IsValid("5265877634"), "Walidacja błędnego NIP-u nie działa.");
 Require(!NipValidator.IsValid("0000000000"), "Walidacja zaakceptowała techniczny, niepoprawny NIP.");
@@ -59,6 +62,7 @@ Require(!NipValidator.IsValid("ABC5265877635"), "Walidacja zaakceptowała niedoz
 Require(AppSettings.GetBaseUri() == new Uri("https://api.ksef.mf.gov.pl/v2/"), "Aplikacja nie używa produkcyjnego endpointu KSeF.");
 await TestKsefProtocolAsync();
 await TestMyDrProtocolAsync();
+await TestMyDrRetryAndPacingAsync();
 await UpdaterSmokeTests.RunAsync(Require);
 if (args.Contains("--live-github", StringComparer.Ordinal))
 {
@@ -212,14 +216,14 @@ static void TestPefUblLineVariant()
 static void TestA4Pagination()
 {
     var shortInvoice = Enumerable.Range(1, 8)
-        .Select(index => new InvoiceLine(index.ToString(), $"Pozycja {index}", "1", "szt.", "10.00", string.Empty,
+        .Select(index => new InvoiceLine(index.ToString(CultureInfo.InvariantCulture), $"Pozycja {index}", "1", "szt.", "10.00", string.Empty,
             string.Empty, "10.00", string.Empty, "2.30", "23"))
         .ToList();
     Require(InvoicePagePlanner.Plan(shortInvoice).Count == 1, "Typowa krótka faktura została niepotrzebnie podzielona na strony.");
 
     var lines = Enumerable.Range(1, 48)
         .Select(index => new InvoiceLine(
-            index.ToString(),
+            index.ToString(CultureInfo.InvariantCulture),
             index % 7 == 0 ? new string('A', 240) : $"Pozycja {index}",
             "1",
             "szt.",
@@ -251,7 +255,9 @@ static void TestA4Pagination()
 static void TestStateContextIsolation()
 {
     var attempt = DateTimeOffset.UtcNow.AddMinutes(-10);
+    var apiBlockedUntil = DateTimeOffset.UtcNow.AddMinutes(3);
     var blockedUntil = DateTimeOffset.UtcNow.AddMinutes(5);
+    var lastDownloadAttempt = DateTimeOffset.UtcNow.AddSeconds(-2);
     var state = new AppState
     {
         ContextNip = "5265877635",
@@ -259,11 +265,18 @@ static void TestStateContextIsolation()
         HistoricalBackfillBeforeIssueDate = new DateOnly(2026, 7, 1),
         LastSuccessfulSyncUtc = DateTimeOffset.UtcNow,
         PermanentStorageHwmDate = DateTimeOffset.UtcNow,
+        ApiBlockedUntilUtc = apiBlockedUntil,
         InvoiceDownloadBlockedUntilUtc = blockedUntil,
+        LastInvoiceDownloadAttemptUtc = lastDownloadAttempt,
         InvoiceDownloadAttemptsUtc = [attempt],
         Invoices = new Dictionary<string, StoredInvoice>(StringComparer.Ordinal)
         {
-            ["OLD-KSEF-NUMBER"] = new StoredInvoice { KsefNumber = "OLD-KSEF-NUMBER" }
+            ["OLD-KSEF-NUMBER"] = new StoredInvoice
+            {
+                KsefNumber = "OLD-KSEF-NUMBER",
+                XmlDownloadFailureCount = 2,
+                NextXmlDownloadAttemptUtc = blockedUntil
+            }
         }
     };
 
@@ -276,6 +289,11 @@ static void TestStateContextIsolation()
         "Migawka stanu zgubiła znacznik uzupełniania historii.");
     Require(snapshot.InvoiceDownloadBlockedUntilUtc == blockedUntil,
         "Migawka stanu zgubiła czas blokady pobierania zwrócony przez KSeF.");
+    Require(snapshot.ApiBlockedUntilUtc == apiBlockedUntil &&
+            snapshot.LastInvoiceDownloadAttemptUtc == lastDownloadAttempt &&
+            snapshot.Invoices["OLD-KSEF-NUMBER"].XmlDownloadFailureCount == 2 &&
+            snapshot.Invoices["OLD-KSEF-NUMBER"].NextXmlDownloadAttemptUtc == blockedUntil,
+        "Migawka stanu zgubiła globalny lub dokumentowy backoff API.");
 
     Require(!state.BindToContext("5265877635"), "Ponowne przypisanie tego samego NIP-u zmieniło cache.");
     Require(state.Invoices.Count == 1, "Cache został usunięty bez zmiany kontekstu.");
@@ -287,6 +305,8 @@ static void TestStateContextIsolation()
         "Zmiana NIP-u zachowała znacznik migracji poprzedniego kontekstu.");
     Require(state.InvoiceDownloadBlockedUntilUtc is null,
         "Zmiana NIP-u zachowała blokadę pobierania poprzedniego kontekstu.");
+    Require(state.ApiBlockedUntilUtc == apiBlockedUntil,
+        "Zmiana NIP-u usunęła globalną blokadę API i mogłaby ominąć Retry-After.");
     Require(state.InvoiceDownloadAttemptsUtc.SequenceEqual([attempt]),
         "Zmiana kontekstu usunęła licznik limitu pobierania API.");
 }
@@ -386,8 +406,9 @@ static void TestUserFacingErrors()
         "Komunikat logowania nie jest prosty albo ujawnia szczegóły techniczne.");
 
     var limited = UserFacingErrors.ForSynchronization(
-        new KsefApiException("KSeF HTTP 429", HttpStatusCode.TooManyRequests));
-    Require(limited.Contains("spróbuje ponownie", StringComparison.OrdinalIgnoreCase),
+        new KsefApiException("KSeF HTTP 429", HttpStatusCode.TooManyRequests, retryAfter: TimeSpan.FromMinutes(7)));
+    Require(limited.Contains("spróbuje ponownie", StringComparison.OrdinalIgnoreCase) &&
+            limited.Contains("7 min", StringComparison.Ordinal),
         "Komunikat limitu KSeF nie wyjaśnia dalszego działania aplikacji.");
 
     var network = UserFacingErrors.ForSynchronization(new HttpRequestException("DNS lookup failed"));
@@ -395,7 +416,7 @@ static void TestUserFacingErrors()
             !network.Contains("DNS", StringComparison.OrdinalIgnoreCase),
         "Komunikat sieciowy pokazuje techniczny błąd DNS.");
 
-    var fallback = UserFacingErrors.ForSynchronization(new Exception("tajny techniczny szczegół"));
+    var fallback = UserFacingErrors.ForSynchronization(new InvalidOperationException("tajny techniczny szczegół"));
     Require(fallback.Contains("dzienniku", StringComparison.OrdinalIgnoreCase) &&
             !fallback.Contains("tajny", StringComparison.OrdinalIgnoreCase),
         "Komunikat ogólny ujawnia treść wyjątku.");
@@ -409,6 +430,10 @@ static void TestUserFacingErrors()
         new MyDrApiException("MyDR nie zwrócił poprawnej kwoty brutto dla jednej z usług."));
     Require(myDrMalformed.Contains("Ostatnia poprawna kwota", StringComparison.Ordinal),
         "Komunikat niepełnych danych MyDR nie wyjaśnia zachowania ostatniej poprawnej sumy.");
+    var myDrLimited = UserFacingErrors.ForMyDrSynchronization(
+        new MyDrApiException("HTTP 429", HttpStatusCode.TooManyRequests, retryAfter: TimeSpan.FromSeconds(31)));
+    Require(myDrLimited.Contains("około minutę", StringComparison.Ordinal),
+        "Komunikat limitu MyDR nie wyjaśnia użytkownikowi czasu bezpiecznego ponowienia.");
 }
 
 static void TestApplicationLog()
@@ -499,10 +524,28 @@ static void TestMyDrStateAndSchedule()
     var state = new MyDrState
     {
         ConnectionId = connectionId,
+        DoctorTurnoverSchemaVersion = MyDrState.CurrentDoctorTurnoverSchemaVersion,
         LastCheckLocalDate = new DateOnly(2026, 8, 2),
+        ApiBlockedUntilUtc = DateTimeOffset.Parse("2026-08-02T12:30:00Z", CultureInfo.InvariantCulture),
         Months = new Dictionary<string, MyDrMonthSummary>(StringComparer.Ordinal)
         {
-            ["2026-08"] = new MyDrMonthSummary { Year = 2026, Month = 8, GrossAmount = 123.45m }
+            ["2026-08"] = new MyDrMonthSummary
+            {
+                Year = 2026,
+                Month = 8,
+                GrossAmount = 123.45m,
+                DoctorBreakdownAvailable = true,
+                DoctorTurnovers =
+                [
+                    new MyDrDoctorTurnover
+                    {
+                        PersonnelId = 71,
+                        DisplayName = "Anna Kowalska",
+                        GrossAmount = 123.45m,
+                        VisitCount = 1
+                    }
+                ]
+            }
         },
         Visits = new Dictionary<long, MyDrCachedVisit>
         {
@@ -511,11 +554,57 @@ static void TestMyDrStateAndSchedule()
     };
     var snapshot = state.Snapshot();
     state.Months["2026-08"].GrossAmount = 0;
+    state.Months["2026-08"].DoctorTurnovers[0].GrossAmount = 0;
     Require(snapshot.Months["2026-08"].GrossAmount == 123.45m,
         "Migawka MyDR współdzieli mutowalne podsumowanie ze stanem aktywnym.");
-    state.BindToConnection(Guid.NewGuid());
-    Require(state.Months.Count == 0 && state.Visits.Count == 0 && state.LastCheckLocalDate is null,
+    Require(snapshot.Months["2026-08"].DoctorTurnovers.Single().GrossAmount == 123.45m,
+        "Migawka MyDR współdzieli listę obrotów lekarzy ze stanem aktywnym.");
+    Require(snapshot.ApiBlockedUntilUtc == DateTimeOffset.Parse("2026-08-02T12:30:00Z", CultureInfo.InvariantCulture),
+        "Migawka MyDR zgubiła Retry-After API.");
+    var roundTrip = JsonSerializer.Deserialize<MyDrState>(JsonSerializer.Serialize(snapshot))
+                    ?? throw new InvalidOperationException("Nie odczytano nowego stanu MyDR po zapisie JSON.");
+    roundTrip.NormalizeAfterLoad();
+    Require(roundTrip.DoctorTurnoverSchemaVersion == MyDrState.CurrentDoctorTurnoverSchemaVersion &&
+            roundTrip.Months["2026-08"].DoctorBreakdownAvailable &&
+            roundTrip.Months["2026-08"].DoctorTurnovers.Single().DisplayName == "Anna Kowalska",
+        "Nowy format stanu MyDR nie przechodzi pełnego cyklu zapis/odczyt.");
+    Require(!state.BindToConnection(connectionId),
+        "Ponowne przypięcie tego samego konta MyDR nie powinno zerować stanu.");
+    Require(state.BindToConnection(Guid.NewGuid()),
+        "Zmiana konta MyDR nie została rozpoznana.");
+    Require(state.Months.Count == 0 && state.Visits.Count == 0 && state.LastCheckLocalDate is null &&
+            state.ApiBlockedUntilUtc is null,
         "Zmiana konta MyDR nie wyczyściła danych poprzedniego połączenia.");
+
+    var legacyJson = $$"""
+        {
+          "ConnectionId": "{{connectionId}}",
+          "LastCheckLocalDate": "2026-08-02",
+          "Months": {
+            "2026-08": { "Year": 2026, "Month": 8, "GrossAmount": 321.00, "VisitCount": 2 }
+          },
+          "Visits": {}
+        }
+        """;
+    var legacy = JsonSerializer.Deserialize<MyDrState>(legacyJson)
+                 ?? throw new InvalidOperationException("Nie odczytano starego stanu MyDR.");
+    legacy.NormalizeAfterLoad();
+    Require(!legacy.Months["2026-08"].DoctorBreakdownAvailable &&
+            legacy.Months["2026-08"].GrossAmount == 321m,
+        "Migracja starego stanu MyDR utraciła sumę albo oznaczyła nieistniejący podział jako gotowy.");
+    Require(legacy.UpgradeDoctorTurnoverSchema() && legacy.LastCheckLocalDate is null &&
+            legacy.DoctorTurnoverSchemaVersion == MyDrState.CurrentDoctorTurnoverSchemaVersion,
+        "Migracja nie zaplanowała jednorazowego pobrania podziału według lekarzy.");
+    Require(!legacy.UpgradeDoctorTurnoverSchema(),
+        "Migracja podziału lekarzy uruchamia się więcej niż jeden raz.");
+
+    var unboundLegacy = JsonSerializer.Deserialize<MyDrState>(
+        """{"Months":{"2026-08":{"GrossAmount":99.00}},"Visits":{"8":{"VisitId":8,"VisitDate":"2026-08-01"}}}""")
+        ?? throw new InvalidOperationException("Nie odczytano niezwiązanego starego stanu MyDR.");
+    unboundLegacy.NormalizeAfterLoad();
+    Require(unboundLegacy.BindToConnection(Guid.Empty) &&
+            unboundLegacy.Months.Count == 0 && unboundLegacy.Visits.Count == 0,
+        "Stan MyDR bez identyfikatora konta pozostał na dysku mimo braku poświadczeń.");
 
     var zone = TimeZoneInfo.CreateCustomTimeZone("Test/Warsaw", TimeSpan.FromHours(2), "Test", "Test");
     var now = DateTimeOffset.Parse("2026-08-02T10:00:00Z", CultureInfo.InvariantCulture);
@@ -538,6 +627,262 @@ static void TestMyDrStateAndSchedule()
         "Letni harmonogram MyDR nie uwzględnia czasu CEST w Warszawie.");
 }
 
+static void TestMyDrDoctorTurnovers()
+{
+    var sources = new[]
+    {
+        new MyDrVisitTurnoverSource(1, " Jan ", " Kowalski ", new DateOnly(2026, 8, 1), 11, 100m),
+        new MyDrVisitTurnoverSource(1, "Jan", "Nowak", new DateOnly(2026, 8, 3), 12, -20m),
+        new MyDrVisitTurnoverSource(1, null, null, new DateOnly(2026, 8, 4), 13, 0m),
+        new MyDrVisitTurnoverSource(2, "Adam", "Nowak", new DateOnly(2026, 8, 2), 21, 80m),
+        new MyDrVisitTurnoverSource(3, "Zero", "Salda", new DateOnly(2026, 8, 2), 31, 50m),
+        new MyDrVisitTurnoverSource(3, "Zero", "Salda", new DateOnly(2026, 8, 3), 32, -50m),
+        new MyDrVisitTurnoverSource(4, "Ewa", "Korekta", new DateOnly(2026, 8, 4), 41, -10m),
+        new MyDrVisitTurnoverSource(5, " \t ", null, new DateOnly(2026, 8, 5), 51, 5m)
+    };
+
+    var result = MyDrDoctorTurnoverCalculator.Calculate(sources);
+    Require(result.Select(item => item.PersonnelId).SequenceEqual([2L, 1L, 5L, 4L]),
+        "Podział obrotu MyDR ma niepoprawne sortowanie albo połączył osoby o tym samym nazwisku.");
+    Require(result.Single(item => item.PersonnelId == 1).DisplayName == "Jan Nowak" &&
+            result.Single(item => item.PersonnelId == 1).VisitCount == 3,
+        "Podział MyDR nie zachował najnowszej dostępnej nazwy albo liczby wizyt lekarza.");
+    Require(result.Single(item => item.PersonnelId == 5).DisplayName == "Personel MyDR #5",
+        "Brakująca nazwa osoby MyDR nie otrzymała bezpiecznego opisu zastępczego.");
+    Require(result.All(item => item.PersonnelId != 3) && result.Any(item => item.GrossAmount < 0m),
+        "Saldo równe zero nie zostało ukryte albo ujemna korekta została utracona.");
+    Require(result.Sum(item => item.GrossAmount) == sources.Sum(item => item.GrossAmount),
+        "Suma obrotów lekarzy różni się od miesięcznego obrotu MyDR.");
+
+    var summary = new MyDrMonthSummary
+    {
+        Year = 2026,
+        Month = 8,
+        GrossAmount = result.Sum(item => item.GrossAmount),
+        DoctorBreakdownAvailable = true,
+        DoctorTurnovers = result.Select(item => item.Snapshot()).Reverse().ToList()
+    };
+    Require(summary.NormalizeDoctorTurnovers() &&
+            summary.DoctorTurnovers.Select(item => item.PersonnelId).SequenceEqual([2L, 1L, 5L, 4L]),
+        "Podział lekarzy nie został poprawnie znormalizowany po odczycie z dysku.");
+    var visibleRows = MyDrDoctorTurnoverPresentation.GetVisibleRows(summary);
+    Require(visibleRows.Select(item => item.PersonnelId).SequenceEqual([2L, 1L, 5L, 4L]) &&
+            visibleRows.Any(item => item.GrossAmount < 0m) &&
+            visibleRows.All(item => item.GrossAmount != 0m),
+        "Warstwa prezentacji MyDR nie ukrywa dokładnie sald zerowych.");
+    visibleRows[0].GrossAmount = 0m;
+    Require(summary.DoctorTurnovers[0].GrossAmount != 0m,
+        "Warstwa prezentacji zwróciła mutowalny element stanu MyDR.");
+    Require(MyDrPersonnelName.FromParts("Anna\nMaria", " Nowak\tTest ") == "Anna Maria Nowak Test",
+        "Normalizacja nazwy personelu skleja wyrazy rozdzielone białymi znakami.");
+
+    var inconsistent = new MyDrMonthSummary
+    {
+        GrossAmount = 5m,
+        DoctorBreakdownAvailable = true,
+        DoctorTurnovers =
+        [
+            new MyDrDoctorTurnover { PersonnelId = 1, DisplayName = "A", GrossAmount = 5m }
+        ]
+    };
+    Require(!inconsistent.NormalizeDoctorTurnovers() &&
+            !inconsistent.DoctorBreakdownAvailable && inconsistent.DoctorTurnovers.Count == 0,
+        "Niespójny podział lekarzy został pokazany jako poprawny.");
+
+    var currentVisit = new MyDrVisit
+    {
+        Id = 91,
+        DoctorId = 71,
+        DoctorName = "Maria",
+        DoctorSurname = "Lekarska",
+        Date = "2026-08-09",
+        State = "Zakończona",
+        VisitKind = "Prywatna"
+    };
+    var cachedVisit = new MyDrCachedVisit
+    {
+        VisitId = 91,
+        VisitDate = new DateOnly(2026, 8, 9),
+        GrossAmount = 147.50m,
+        ServiceCount = 2
+    };
+    var calculatedSummary = MyDrMonthSummaryCalculator.Calculate(
+        2026,
+        8,
+        DateTimeOffset.Parse("2026-08-10T10:00:00Z", CultureInfo.InvariantCulture),
+        [new MyDrPerformedVisitTurnover(currentVisit, cachedVisit.VisitDate, cachedVisit)]);
+    Require(calculatedSummary.GrossAmount == 147.50m && calculatedSummary.VisitCount == 1 &&
+            calculatedSummary.ServiceCount == 2 && calculatedSummary.DoctorBreakdownAvailable &&
+            calculatedSummary.DoctorTurnovers.Single().PersonnelId == 71 &&
+            calculatedSummary.DoctorTurnovers.Single().DisplayName == "Maria Lekarska",
+        "Miesięczne podsumowanie nie połączyło aktualnej osoby wizyty z poprawną kwotą cache.");
+
+    try
+    {
+        _ = MyDrMonthSummaryCalculator.Calculate(
+            2026,
+            8,
+            DateTimeOffset.UtcNow,
+            [new MyDrPerformedVisitTurnover(currentVisit, cachedVisit.VisitDate,
+                new MyDrCachedVisit { VisitId = 92, VisitDate = cachedVisit.VisitDate, GrossAmount = 147.50m })]);
+        throw new InvalidOperationException("Podsumowanie MyDR zaakceptowało cache innej wizyty.");
+    }
+    catch (InvalidOperationException exception)
+    {
+        Require(exception.Message.Contains("Cache wizyty", StringComparison.Ordinal),
+            "Niezgodny cache MyDR nie zwrócił bezpiecznego komunikatu.");
+    }
+
+    var performedWithoutPerson = new MyDrVisit
+    {
+        Id = 93,
+        DoctorId = null,
+        Date = "2026-08-10",
+        State = "Zakończona",
+        VisitKind = "Prywatna"
+    };
+    try
+    {
+        _ = MyDrMonthSummaryCalculator.Calculate(
+            2026,
+            8,
+            DateTimeOffset.UtcNow,
+            [new MyDrPerformedVisitTurnover(
+                performedWithoutPerson,
+                new DateOnly(2026, 8, 10),
+                new MyDrCachedVisit
+                {
+                    VisitId = 93,
+                    VisitDate = new DateOnly(2026, 8, 10),
+                    GrossAmount = 10m,
+                    ServiceCount = 1
+                })]);
+        throw new InvalidOperationException("Podsumowanie MyDR zaakceptowało wykonaną wizytę bez personelu.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(exception.Message.Contains("identyfikatora osoby", StringComparison.OrdinalIgnoreCase),
+            "Wykonana wizyta bez personelu nie zwróciła bezpiecznego komunikatu.");
+    }
+
+    try
+    {
+        _ = MyDrDoctorTurnoverCalculator.Calculate(
+            [new MyDrVisitTurnoverSource(0, "A", "B", new DateOnly(2026, 8, 1), 1, 1m)]);
+        throw new InvalidOperationException("Agregator MyDR zaakceptował niepoprawny identyfikator personelu.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(exception.Message.Contains("identyfikatora osoby", StringComparison.OrdinalIgnoreCase),
+            "Błąd identyfikatora personelu MyDR nie jest bezpieczny ani czytelny.");
+    }
+
+    try
+    {
+        _ = MyDrDoctorTurnoverCalculator.Calculate(
+        [
+            new MyDrVisitTurnoverSource(1, "A", "B", new DateOnly(2026, 8, 1), 1, decimal.MaxValue),
+            new MyDrVisitTurnoverSource(1, "A", "B", new DateOnly(2026, 8, 2), 2, 1m)
+        ]);
+        throw new InvalidOperationException("Agregator MyDR zaakceptował kwotę spoza zakresu decimal.");
+    }
+    catch (OverflowException)
+    {
+        // Oczekiwane: synchronizacja zachowa poprzednią poprawną migawkę.
+    }
+}
+
+static void TestApiTrafficPolicies()
+{
+    var visit = new MyDrVisit
+    {
+        Id = 17,
+        Date = "2026-08-02",
+        State = "Do rozliczenia",
+        LatestModification = "2026-08-02T12:00:00"
+    };
+    var cached = new MyDrCachedVisit
+    {
+        VisitId = 17,
+        VisitDate = new DateOnly(2026, 8, 2),
+        State = "Do rozliczenia",
+        LatestModification = "2026-08-02T12:00:00",
+        GrossAmount = 100m
+    };
+    Require(MyDrVisitCachePolicy.CanReuse(visit, new DateOnly(2026, 8, 2), cached),
+        "Niezmieniona wizyta MyDR nie korzysta z cache i generowałaby zbędny GET usług.");
+    Require(!MyDrVisitCachePolicy.CanReuse(visit, new DateOnly(2026, 8, 2), cached, forceRefresh: true),
+        "Ręczne pełne odświeżenie MyDR nie omija cache wizyt.");
+    visit.LatestModification = "2026-08-02T12:01:00";
+    Require(!MyDrVisitCachePolicy.CanReuse(visit, new DateOnly(2026, 8, 2), cached),
+        "Zmieniona wizyta MyDR błędnie korzysta z nieaktualnego cache.");
+    visit.LatestModification = string.Empty;
+    Require(!MyDrVisitCachePolicy.CanReuse(visit, new DateOnly(2026, 8, 2), cached),
+        "Wizyta bez znacznika modyfikacji nie może bezpiecznie korzystać z cache.");
+
+    Require(KsefXmlDownloadPolicy.ShouldStopQueue(HttpStatusCode.Unauthorized) &&
+            KsefXmlDownloadPolicy.ShouldStopQueue(HttpStatusCode.Forbidden) &&
+            KsefXmlDownloadPolicy.ShouldStopQueue(HttpStatusCode.InternalServerError) &&
+            KsefXmlDownloadPolicy.ShouldStopQueue(HttpStatusCode.TooManyRequests) &&
+            !KsefXmlDownloadPolicy.ShouldStopQueue(HttpStatusCode.NotFound),
+        "Polityka kolejki XML nie rozróżnia awarii całego API od błędu pojedynczego dokumentu.");
+    Require(KsefXmlDownloadPolicy.GetRetryDelay(1, HttpStatusCode.NotFound) == TimeSpan.FromMinutes(15) &&
+            KsefXmlDownloadPolicy.GetRetryDelay(2, HttpStatusCode.NotFound) == TimeSpan.FromHours(1) &&
+            KsefXmlDownloadPolicy.GetRetryDelay(3, HttpStatusCode.NotFound) == TimeSpan.FromHours(4) &&
+            KsefXmlDownloadPolicy.GetRetryDelay(10, HttpStatusCode.NotFound) == TimeSpan.FromHours(24) &&
+            KsefXmlDownloadPolicy.GetRetryDelay(1, HttpStatusCode.TooManyRequests, TimeSpan.FromHours(2)) ==
+            TimeSpan.FromHours(2),
+        "Backoff XML nie rośnie wykładniczo albo ignoruje Retry-After serwera.");
+
+    var now = DateTimeOffset.UtcNow;
+    var pendingInvoices = Enumerable.Range(1, 63)
+        .Select(index => new StoredInvoice
+        {
+            KsefNumber = $"KSEF-{index}",
+            DiscoveredAtUtc = now.AddMinutes(index),
+            ViewedAtUtc = index == 1 ? null : now,
+            NextXmlDownloadAttemptUtc = index == 2 ? now.AddHours(1) : null,
+            Xml = index == 3 ? "<Faktura/>" : null
+        })
+        .ToList();
+    var selected = KsefXmlDownloadPolicy.SelectPending(pendingInvoices, now, 60);
+    Require(selected.Count == 60 && selected[0].KsefNumber == "KSEF-1" &&
+            selected.All(invoice => invoice.KsefNumber is not ("KSEF-2" or "KSEF-3")),
+        "Kolejka XML przekracza limit, ignoruje backoff albo nie daje pierwszeństwa nowej fakturze.");
+
+    const int visitsPerDay = 20;
+    const int days = 30;
+    var previousDailyReloadRequests = visitsPerDay * days * (days + 1) / 2;
+    var incrementalRequests = visitsPerDay * days;
+    Require(previousDailyReloadRequests == 9300 && incrementalRequests == 600,
+        "Test modelu obciążenia MyDR ma niepoprawne założenia.");
+}
+
+static void TestAtomicMyDrStateReplacement()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "ksef-monitor-mydr-replace-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var path = Path.Combine(directory, "mydr-state.dat");
+        File.WriteAllBytes(path, Encoding.UTF8.GetBytes("POPRZEDNIE_KONTO"));
+        File.WriteAllBytes(path + ".bak", Encoding.UTF8.GetBytes("BACKUP_POPRZEDNIEGO_KONTA"));
+        File.WriteAllBytes(path + ".tmp", Encoding.UTF8.GetBytes("NIEDOKONCZONY_ZAPIS"));
+        var replacement = Encoding.UTF8.GetBytes("NOWY_PUSTY_STAN");
+
+        AppStore.AtomicReplaceWithoutBackup(path, replacement);
+
+        Require(File.ReadAllBytes(path).SequenceEqual(replacement),
+            "Atomowa zmiana konta MyDR nie zapisała nowego stanu.");
+        Require(!File.Exists(path + ".bak") && !File.Exists(path + ".tmp"),
+            "Po zmianie konta pozostała kopia lub plik tymczasowy danych poprzedniego konta MyDR.");
+    }
+    finally
+    {
+        if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+    }
+}
+
 static async Task TestMyDrProtocolAsync()
 {
     var clientId = "TEST_ONLY_CLIENT_" + Guid.NewGuid().ToString("N");
@@ -545,9 +890,9 @@ static async Task TestMyDrProtocolAsync()
     var refreshToken = "TEST_ONLY_REFRESH_" + Guid.NewGuid().ToString("N");
     var rotatedRefreshToken = "TEST_ONLY_ROTATED_" + Guid.NewGuid().ToString("N");
     var accessToken = "TEST_ONLY_ACCESS_" + Guid.NewGuid().ToString("N");
-    var tokenRequestSeen = false;
+    var tokenRequestCount = 0;
     var requestedPages = new List<int>();
-    var servicesRequestSeen = false;
+    var serviceRequestCount = 0;
     string? immediatelyPersistedRefreshToken = null;
 
     using var handler = new DelegateHandler(async (message, cancellationToken) =>
@@ -556,7 +901,7 @@ static async Task TestMyDrProtocolAsync()
         var path = message.RequestUri?.AbsolutePath ?? string.Empty;
         if (path.EndsWith("/o/token/", StringComparison.Ordinal))
         {
-            tokenRequestSeen = true;
+            tokenRequestCount++;
             Require(message.Method == HttpMethod.Post, "OAuth MyDR nie używa POST.");
             var form = ParseForm(await message.Content!.ReadAsStringAsync(cancellationToken));
             Require(form.Count == 4 &&
@@ -581,47 +926,53 @@ static async Task TestMyDrProtocolAsync()
             var page = int.Parse(query["page"], CultureInfo.InvariantCulture);
             requestedPages.Add(page);
             return page == 1
-                ? Json(HttpStatusCode.OK, """{"current_page":1,"last_page":2,"count":2,"next":"https://niezaufany.example/strona/2","results":[{"id":11,"date":"2026-08-02","state":"Do rozliczenia","visit_kind":"Prywatna","latest_modification":"2026-08-02T12:00:00"}]}""")
-                : Json(HttpStatusCode.OK, """{"current_page":2,"last_page":2,"count":2,"next":null,"results":[{"id":12,"date":"2026-08-03","state":"Zaplanowana","visit_kind":"Prywatna","latest_modification":"2026-08-02T13:00:00"}]}""");
+                ? Json(HttpStatusCode.OK, """{"current_page":1,"last_page":2,"count":2,"next":"https://niezaufany.example/strona/2","results":[{"id":11,"doctor":"71","doctor_name":"Anna","doctor_surname":"Kowalska","date":"2026-08-02","state":"Do rozliczenia","visit_kind":"Prywatna","latest_modification":"2026-08-02T12:00:00"}]}""")
+                : Json(HttpStatusCode.OK, """{"current_page":2,"last_page":2,"count":2,"next":null,"results":[{"id":12,"doctor":null,"date":"2026-08-03","state":"Zaplanowana","visit_kind":"Prywatna","latest_modification":"2026-08-02T13:00:00"}]}""");
         }
 
         if (path.EndsWith("/visits/11/services/", StringComparison.Ordinal))
         {
-            servicesRequestSeen = true;
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK,
                 """[{"id":"101","name":{"historyczny_format":true},"quantity":"2.00","base_price":100.00,"discount":10.00,"value":190.00},{"id":102,"insurer_service_code":12345,"quantity":1,"base_price":"50.00","discount":null,"value":"50.00"}]""");
         }
 
         if (path.EndsWith("/visits/12/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK,
                 """[{"id":201,"quantity":2,"base_price":"100.00","discount":"10.00","value":"190.00"}]""");
         }
 
         if (path.EndsWith("/visits/13/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK,
                 """{"count":1,"next":null,"results":[{"id":301,"value":"190.00"}]}""");
         }
 
         if (path.EndsWith("/visits/14/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK,
                 """[{"id":401,"name":"DANE_MEDYCZNE_TEST","value":"DANE_MEDYCZNE_TEST"}]""");
         }
 
         if (path.EndsWith("/visits/15/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK, """[{"id":501,"value":null}]""");
         }
 
         if (path.EndsWith("/visits/16/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK, """[{"id":601,"value":-10.50},{"id":602,"value":"-0.50"}]""");
         }
 
         if (path.EndsWith("/visits/17/services/", StringComparison.Ordinal))
         {
+            serviceRequestCount++;
             return Json(HttpStatusCode.OK, "[]");
         }
 
@@ -637,18 +988,22 @@ static async Task TestMyDrProtocolAsync()
     using var client = new MyDrApiClient(
         credentials,
         handler,
-        rotated => immediatelyPersistedRefreshToken = rotated);
+        rotated => immediatelyPersistedRefreshToken = rotated,
+        TimeSpan.Zero);
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     var token = await client.AuthenticateAsync(timeout.Token);
-    Require(tokenRequestSeen && token.RotatedRefreshToken == rotatedRefreshToken &&
+    Require(tokenRequestCount == 1 && token.RotatedRefreshToken == rotatedRefreshToken &&
             immediatelyPersistedRefreshToken == rotatedRefreshToken &&
             client.TakeRotatedRefreshToken() == rotatedRefreshToken && client.TakeRotatedRefreshToken() is null,
         "Klient MyDR nie przekazał rotacji Refresh Tokena do natychmiastowego zapisu.");
     var visits = await client.GetPrivateVisitsAsync(new DateOnly(2026, 8, 1), new DateOnly(2026, 8, 31), timeout.Token);
     Require(requestedPages.SequenceEqual([1, 2]) && visits.Select(visit => visit.Id).SequenceEqual([11L, 12L]),
         "Klient MyDR nie obsłużył bezpiecznie paginacji lub filtra wizyt prywatnych.");
+    Require(visits[0].DoctorId == 71 && visits[0].DoctorName == "Anna" && visits[0].DoctorSurname == "Kowalska" &&
+            visits[1].DoctorId is null && !visits[1].IsPerformed,
+        "Klient MyDR nie odczytał osoby realizującej albo odrzucił niewykonaną wizytę bez przypisanej osoby.");
     var services = await client.GetVisitServicesAsync(11, timeout.Token);
-    Require(servicesRequestSeen &&
+    Require(serviceRequestCount == 1 &&
             services.Select(service => service.Id).SequenceEqual([101L, 102L]) &&
             services.Sum(MyDrApiClient.GetServiceGrossValue) == 240m,
         "Klient MyDR nie obsłużył produkcyjnego wariantu liczba/tekst w polach usług.");
@@ -695,6 +1050,83 @@ static async Task TestMyDrProtocolAsync()
         Require(exception.Message.Contains("kwoty brutto", StringComparison.OrdinalIgnoreCase),
             "Brak kwoty usługi nie zwrócił bezpiecznego komunikatu.");
     }
+
+    Require(tokenRequestCount == 1 && requestedPages.Count == 2 && serviceRequestCount == 7,
+        "Klient MyDR wykonał nadmiarowe logowanie, stronę listy albo pobranie usług.");
+
+}
+
+static async Task TestMyDrRetryAndPacingAsync()
+{
+    var tokenRequests = 0;
+    var visitOneRequests = 0;
+    var visitTwoRequests = 0;
+    var accessToken = string.Empty;
+    var requestTimes = new List<DateTimeOffset>();
+
+    using var handler = new DelegateHandler((message, _) =>
+    {
+        var path = message.RequestUri?.AbsolutePath ?? string.Empty;
+        if (path.EndsWith("/o/token/", StringComparison.Ordinal))
+        {
+            tokenRequests++;
+            accessToken = $"access-{tokenRequests}";
+            return Task.FromResult(Json(HttpStatusCode.OK,
+                $$"""{"expires_in":36000,"access_token":"{{accessToken}}","token_type":"Bearer","scope":"external_api","requires_2fa":false}"""));
+        }
+
+        Require(message.Headers.Authorization?.Parameter == accessToken,
+            "Ponowione żądanie MyDR nie użyło nowego Access Tokena.");
+        requestTimes.Add(DateTimeOffset.UtcNow);
+        if (path.EndsWith("/visits/1/services/", StringComparison.Ordinal))
+        {
+            visitOneRequests++;
+            return Task.FromResult(visitOneRequests == 1
+                ? Json(HttpStatusCode.Unauthorized, "{}")
+                : Json(HttpStatusCode.OK, "[]"));
+        }
+
+        if (path.EndsWith("/visits/2/services/", StringComparison.Ordinal))
+        {
+            visitTwoRequests++;
+            var limited = Json(HttpStatusCode.TooManyRequests, "{}");
+            limited.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(31));
+            return Task.FromResult(limited);
+        }
+
+        return Task.FromResult(Json(HttpStatusCode.NotFound, "{}"));
+    });
+
+    var credentials = new MyDrCredentials
+    {
+        ClientId = "client",
+        ClientSecret = "secret",
+        RefreshToken = "refresh"
+    };
+    using var client = new MyDrApiClient(credentials, handler, minimumRequestInterval: TimeSpan.FromMilliseconds(40));
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    await client.AuthenticateAsync(timeout.Token);
+    _ = await client.GetVisitServicesAsync(1, timeout.Token);
+    Require(tokenRequests == 2 && visitOneRequests == 2,
+        "HTTP 401 MyDR nie wykonał dokładnie jednego odnowienia tokena i jednej ponownej próby.");
+
+    try
+    {
+        _ = await client.GetVisitServicesAsync(2, timeout.Token);
+        throw new InvalidOperationException("Klient MyDR zignorował HTTP 429.");
+    }
+    catch (MyDrApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.TooManyRequests &&
+                exception.RetryAfter is { TotalSeconds: >= 30 and <= 31 } &&
+                visitTwoRequests == 1,
+            "MyDR 429 został ponowiony albo utracono Retry-After.");
+    }
+
+    Require(requestTimes.Count == 3 &&
+            requestTimes.Zip(requestTimes.Skip(1), (left, right) => right - left)
+                .All(interval => interval >= TimeSpan.FromMilliseconds(30)),
+        "Klient MyDR nie rozkłada kolejnych żądań API w czasie.");
 }
 
 static Dictionary<string, string> ParseForm(string value) => value
@@ -724,11 +1156,20 @@ static async Task TestKsefProtocolAsync()
     var invoiceDownloadSeen = false;
     var rateLimitNext = false;
     var badRequestNext = false;
+    var missingHwmNext = false;
+    var unauthorizedMetadataResponses = 0;
+    HttpStatusCode? refreshFailureStatus = null;
+    var expectedAccessToken = "access-token";
+    var refreshSequence = 0;
+    var requestCounts = new Dictionary<string, int>(StringComparer.Ordinal);
     var metadataRanges = new List<(DateTimeOffset From, DateTimeOffset? To, bool RestrictToHwm)>();
+    var metadataRequestTimes = new List<DateTimeOffset>();
+    var metadataProtocolReservations = 0;
 
     using var handler = new DelegateHandler(async (message, cancellationToken) =>
     {
         var path = message.RequestUri?.AbsolutePath ?? string.Empty;
+        requestCounts[path] = requestCounts.GetValueOrDefault(path) + 1;
         if (path.EndsWith("/security/public-key-certificates", StringComparison.Ordinal))
             return Json(HttpStatusCode.OK, $$"""[{"certificate":"{{certificateBase64}}","publicKeyId":"{{publicKeyId}}","validFrom":"2025-01-01T00:00:00Z","validTo":"2030-01-01T00:00:00Z","usage":["KsefTokenEncryption"]}]""");
 
@@ -758,9 +1199,34 @@ static async Task TestKsefProtocolAsync()
             return Json(HttpStatusCode.OK, """{"accessToken":{"token":"access-token","validUntil":"2030-01-01T00:00:00Z"},"refreshToken":{"token":"refresh-token","validUntil":"2030-01-02T00:00:00Z"}}""");
         }
 
+        if (path.EndsWith("/auth/token/refresh", StringComparison.Ordinal))
+        {
+            Require(message.Headers.Authorization?.Parameter == "refresh-token", "Brak RefreshToken przy odnowieniu sesji KSeF.");
+            if (refreshFailureStatus is { } failureStatus)
+            {
+                refreshFailureStatus = null;
+                var failure = Json(failureStatus, """{"detail":"Chwilowy błąd odnowienia"}""");
+                if (failureStatus == HttpStatusCode.TooManyRequests)
+                    failure.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(37));
+                return failure;
+            }
+            expectedAccessToken = $"access-token-refreshed-{++refreshSequence}";
+            return Json(HttpStatusCode.OK,
+                JsonSerializer.Serialize(new
+                {
+                    accessToken = new { token = expectedAccessToken, validUntil = "2030-01-01T00:00:00Z" }
+                }));
+        }
+
         if (path.EndsWith("/invoices/query/metadata", StringComparison.Ordinal))
         {
-            Require(message.Headers.Authorization?.Parameter == "access-token", "Brak AccessToken przy pobieraniu metadanych.");
+            metadataRequestTimes.Add(DateTimeOffset.UtcNow);
+            Require(message.Headers.Authorization?.Parameter == expectedAccessToken, "Brak aktualnego AccessToken przy pobieraniu metadanych.");
+            if (unauthorizedMetadataResponses > 0)
+            {
+                unauthorizedMetadataResponses--;
+                return Json(HttpStatusCode.Unauthorized, "{}");
+            }
             using var body = JsonDocument.Parse(await message.Content!.ReadAsStringAsync(cancellationToken));
             Require(body.RootElement.GetProperty("subjectType").GetString() == "Subject2", "Zapytanie nie dotyczy faktur otrzymanych.");
             var dateRange = body.RootElement.GetProperty("dateRange");
@@ -783,9 +1249,15 @@ static async Task TestKsefProtocolAsync()
             }
             if (rateLimitNext)
             {
+                rateLimitNext = false;
                 var limited = Json(HttpStatusCode.TooManyRequests, """{"detail":"Limit żądań"}""");
                 limited.Headers.RetryAfter = new RetryConditionHeaderValue(TimeSpan.FromSeconds(42));
                 return limited;
+            }
+            if (missingHwmNext)
+            {
+                missingHwmNext = false;
+                return Json(HttpStatusCode.OK, """{"hasMore":false,"isTruncated":false,"invoices":[]}""");
             }
             return Json(HttpStatusCode.OK, """
             {
@@ -815,14 +1287,31 @@ static async Task TestKsefProtocolAsync()
     });
 
     var settings = new AppSettings { Nip = "5265877635" };
-    using var client = new KsefApiClient(settings, secret, handler);
+    using var client = new KsefApiClient(
+        settings,
+        secret,
+        handler,
+        metadataRequestInterval: TimeSpan.Zero,
+        metadataRequestReservation: _ =>
+        {
+            metadataProtocolReservations++;
+            return Task.CompletedTask;
+        });
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     await client.AuthenticateAsync(timeout.Token);
+    Require(CountRequests(requestCounts, "/security/public-key-certificates") == 1 &&
+            CountRequests(requestCounts, "/auth/challenge") == 1 &&
+            CountRequests(requestCounts, "/auth/ksef-token") == 1 &&
+            CountRequests(requestCounts, "/auth/AUTH-REF") == 1 &&
+            CountRequests(requestCounts, "/auth/token/redeem") == 1,
+        "Pełne uwierzytelnienie KSeF wykonało nadmiarową liczbę żądań.");
     await client.VerifyInvoiceReadAccessAsync(timeout.Token);
     Require(metadataRanges.Count == 1 && !metadataRanges[0].RestrictToHwm,
         "Test uprawnienia InvoiceRead może fałszywie zwrócić błąd HWM 21183.");
     metadataRanges.Clear();
-    var result = await client.QueryReceivedInvoicesAsync(DateTimeOffset.Parse("2026-07-01T00:00:00+02:00"), timeout.Token);
+    var result = await client.QueryReceivedInvoicesAsync(
+        DateTimeOffset.Parse("2026-07-01T00:00:00+02:00", CultureInfo.InvariantCulture),
+        timeout.Token);
     Require(querySeen, "Nie wysłano zapytania o metadane.");
     Require(result.Invoices.Count == 1, "Nie odczytano metadanych z API.");
     Require(result.Invoices[0].SellerName == "Test Sp. z o.o.", "Nie odczytano nazwy sprzedawcy z API.");
@@ -842,6 +1331,77 @@ static async Task TestKsefProtocolAsync()
             metadataRanges[1].From == firstWindowEnd && metadataRanges[1].To is null,
         "Okna metadanych nie są przylegające lub ostatnie okno ma zbędną datę końcową.");
     Require(longRangeResult.Invoices.Count == 1, "Deduplikacja faktur na granicach okien nie działa.");
+
+    var fullAuthRequestsBeforeRefreshFailure = CountFullKsefAuthenticationRequests(requestCounts);
+    var refreshRequestsBefore = CountRequests(requestCounts, "/auth/token/refresh");
+    var metadataRequestsBefore = CountRequests(requestCounts, "/invoices/query/metadata");
+    unauthorizedMetadataResponses = 1;
+    refreshFailureStatus = HttpStatusCode.TooManyRequests;
+    try
+    {
+        await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient KSeF zignorował 429 podczas odnowienia tokena.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.TooManyRequests &&
+                exception.RetryAfter is { TotalSeconds: >= 36 and <= 37 },
+            "Odnowienie KSeF utraciło HTTP 429 lub Retry-After.");
+    }
+    Require(CountRequests(requestCounts, "/auth/token/refresh") == refreshRequestsBefore + 1 &&
+            CountRequests(requestCounts, "/invoices/query/metadata") == metadataRequestsBefore + 1 &&
+            CountFullKsefAuthenticationRequests(requestCounts) == fullAuthRequestsBeforeRefreshFailure,
+        "Błąd 429 refresh tokena uruchomił zbędne pełne logowanie KSeF.");
+
+    // Po chwilowym błędzie refresh token pozostaje użyteczny; następna próba
+    // wymaga dokładnie jednego refresh i jednego żądania docelowego.
+    refreshRequestsBefore = CountRequests(requestCounts, "/auth/token/refresh");
+    metadataRequestsBefore = CountRequests(requestCounts, "/invoices/query/metadata");
+    _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+    Require(CountRequests(requestCounts, "/auth/token/refresh") == refreshRequestsBefore + 1 &&
+            CountRequests(requestCounts, "/invoices/query/metadata") == metadataRequestsBefore + 1,
+        "Ciepłe odnowienie KSeF wykonało więcej niż jedno żądanie refresh lub metadata.");
+
+    refreshRequestsBefore = CountRequests(requestCounts, "/auth/token/refresh");
+    metadataRequestsBefore = CountRequests(requestCounts, "/invoices/query/metadata");
+    unauthorizedMetadataResponses = 1;
+    _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+    Require(CountRequests(requestCounts, "/auth/token/refresh") == refreshRequestsBefore + 1 &&
+            CountRequests(requestCounts, "/invoices/query/metadata") == metadataRequestsBefore + 2,
+        "HTTP 401 KSeF nie wykonał dokładnie jednego refresh i jednej ponownej próby.");
+
+    refreshRequestsBefore = CountRequests(requestCounts, "/auth/token/refresh");
+    metadataRequestsBefore = CountRequests(requestCounts, "/invoices/query/metadata");
+    unauthorizedMetadataResponses = 2;
+    try
+    {
+        _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient KSeF wykonał więcej niż jedną ponowną próbę po 401.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.Unauthorized,
+            "Drugi HTTP 401 KSeF nie został zwrócony do harmonogramu.");
+    }
+    Require(CountRequests(requestCounts, "/auth/token/refresh") == refreshRequestsBefore + 1 &&
+            CountRequests(requestCounts, "/invoices/query/metadata") == metadataRequestsBefore + 2,
+        "Klient KSeF ponowił żądanie więcej niż jeden raz po 401.");
+
+    fullAuthRequestsBeforeRefreshFailure = CountFullKsefAuthenticationRequests(requestCounts);
+    unauthorizedMetadataResponses = 1;
+    refreshFailureStatus = HttpStatusCode.ServiceUnavailable;
+    try
+    {
+        _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient KSeF zignorował 503 podczas odnowienia tokena.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.StatusCode == HttpStatusCode.ServiceUnavailable,
+            "Odnowienie KSeF utraciło HTTP 503.");
+    }
+    Require(CountFullKsefAuthenticationRequests(requestCounts) == fullAuthRequestsBeforeRefreshFailure,
+        "Błąd 503 refresh tokena uruchomił zbędne pełne logowanie KSeF.");
 
     badRequestNext = true;
     try
@@ -870,7 +1430,53 @@ static async Task TestKsefProtocolAsync()
         Require(exception.StatusCode == HttpStatusCode.TooManyRequests, "Nie zachowano kodu HTTP 429.");
         Require(exception.RetryAfter is { TotalSeconds: >= 41 and <= 42 }, "Nie odczytano nagłówka Retry-After.");
     }
+
+    missingHwmNext = true;
+    try
+    {
+        _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-5), timeout.Token);
+        throw new InvalidOperationException("Klient KSeF zaakceptował metadane bez punktu HWM.");
+    }
+    catch (KsefApiException exception)
+    {
+        Require(exception.Message.Contains("niepełną odpowiedź", StringComparison.OrdinalIgnoreCase),
+            "Brak HWM nie został zgłoszony jako niepełna odpowiedź KSeF.");
+    }
+
+    Require(metadataProtocolReservations == CountRequests(requestCounts, "/invoices/query/metadata"),
+        "Nie każde fizyczne żądanie metadanych KSeF, w tym retry po 401, zarezerwowało osobny limit.");
+
+    metadataRequestTimes.Clear();
+    expectedAccessToken = "access-token";
+    var metadataReservations = 0;
+    using var pacingClient = new KsefApiClient(
+        settings,
+        secret,
+        handler,
+        metadataRequestInterval: TimeSpan.FromMilliseconds(40),
+        metadataRequestReservation: _ =>
+        {
+            metadataReservations++;
+            return Task.CompletedTask;
+        });
+    using var pacingTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    await pacingClient.AuthenticateAsync(pacingTimeout.Token);
+    await pacingClient.VerifyInvoiceReadAccessAsync(pacingTimeout.Token);
+    await pacingClient.VerifyInvoiceReadAccessAsync(pacingTimeout.Token);
+    Require(metadataReservations == 2 && metadataRequestTimes.Count == 2 &&
+            metadataRequestTimes[1] - metadataRequestTimes[0] >= TimeSpan.FromMilliseconds(30),
+        "Klient KSeF nie rezerwuje lub nie rozkłada kolejnych zapytań o metadane w czasie.");
 }
+
+static int CountRequests(IReadOnlyDictionary<string, int> counts, string pathSuffix) =>
+    counts.Where(pair => pair.Key.EndsWith(pathSuffix, StringComparison.Ordinal)).Sum(pair => pair.Value);
+
+static int CountFullKsefAuthenticationRequests(IReadOnlyDictionary<string, int> counts) =>
+    CountRequests(counts, "/security/public-key-certificates") +
+    CountRequests(counts, "/auth/challenge") +
+    CountRequests(counts, "/auth/ksef-token") +
+    CountRequests(counts, "/auth/AUTH-REF") +
+    CountRequests(counts, "/auth/token/redeem");
 
 static HttpResponseMessage Json(HttpStatusCode status, string json) => new(status)
 {

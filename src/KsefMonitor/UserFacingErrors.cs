@@ -24,7 +24,7 @@ internal sealed class StatusBannerState
 
     public StatusBannerState(TimeSpan errorLifetime)
     {
-        if (errorLifetime <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(errorLifetime));
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(errorLifetime, TimeSpan.Zero);
         _errorLifetime = errorLifetime;
     }
 
@@ -62,7 +62,7 @@ internal static class UserFacingErrors
             if (api.Message.Contains("Uwierzytelnienie", StringComparison.OrdinalIgnoreCase))
                 return "Nie udało się zalogować do KSeF. Sprawdź NIP i token w ustawieniach.";
             if (api.StatusCode == HttpStatusCode.TooManyRequests)
-                return "KSeF chwilowo ograniczył liczbę zapytań. Aplikacja spróbuje ponownie automatycznie.";
+                return $"KSeF chwilowo ograniczył liczbę zapytań. Aplikacja spróbuje ponownie automatycznie{FormatRetryDelay(api.RetryAfter)}.";
             if (api.StatusCode is { } statusCode && (int)statusCode >= 500)
                 return "KSeF jest chwilowo niedostępny. Aplikacja spróbuje ponownie automatycznie.";
             if (api.HasErrorCode(21183))
@@ -122,7 +122,7 @@ internal static class UserFacingErrors
             if (api.StatusCode == HttpStatusCode.Forbidden)
                 return "MyDR nie pozwala odczytać wizyt i usług. Poproś administratora MyDR o sprawdzenie dostępu do API.";
             if (api.StatusCode == HttpStatusCode.TooManyRequests)
-                return "MyDR chwilowo ograniczył liczbę zapytań. Możesz spróbować ponownie później w ustawieniach.";
+                return $"MyDR chwilowo ograniczył liczbę zapytań. Spróbuj ponownie{FormatRetryDelay(api.RetryAfter)}.";
             if (api.StatusCode is { } statusCode && (int)statusCode >= 500)
                 return "MyDR jest chwilowo niedostępny. Aplikacja zachowała ostatnią poprawną kwotę.";
             if (api.Message.Contains("kwoty brutto", StringComparison.OrdinalIgnoreCase) ||
@@ -166,4 +166,12 @@ internal static class UserFacingErrors
     private static bool IsLocalStorageError(Exception exception) =>
         exception is IOException or UnauthorizedAccessException or CryptographicException ||
         exception.Message.Contains("DPAPI", StringComparison.OrdinalIgnoreCase);
+
+    private static string FormatRetryDelay(TimeSpan? retryAfter)
+    {
+        if (retryAfter is not { } delay || delay <= TimeSpan.Zero) return " później";
+        if (delay < TimeSpan.FromMinutes(1)) return " za około minutę";
+        if (delay < TimeSpan.FromHours(1)) return $" za około {Math.Ceiling(delay.TotalMinutes):0} min";
+        return $" za około {Math.Ceiling(delay.TotalHours):0} godz.";
+    }
 }

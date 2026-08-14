@@ -27,7 +27,11 @@ internal sealed class SynchronizationService : IDisposable
     public const int VisibleHistoryMonthsBack = 3;
     private static readonly TimeSpan FailureRetryInterval = SyncInterval;
     private static readonly TimeSpan BusyRetryInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan InvoiceDownloadInterval = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan MetadataRequestInterval = TimeSpan.FromSeconds(4);
+    private static readonly TimeSpan MaximumTimerDue = TimeSpan.FromDays(30);
     private const int MaxInvoiceDownloadsPerHour = 60;
+    private const int MaxMetadataRequestsPerHour = 18;
 
     private readonly AppStore _store;
     private readonly ApplicationLog _log;
@@ -38,6 +42,7 @@ internal sealed class SynchronizationService : IDisposable
     private readonly object _configurationGate = new();
     private readonly object _scheduleGate = new();
     private readonly object _lifecycleGate = new();
+    private readonly List<DateTimeOffset> _metadataRequestAttemptsUtc;
     private CancellationTokenSource _configurationChanged = new();
     private Timer? _timer;
     private KsefApiClient? _client;
@@ -48,6 +53,7 @@ internal sealed class SynchronizationService : IDisposable
     private DateTimeOffset? _nextScheduledSyncUtc;
     private int _isSynchronizing;
     private int _activeOperations;
+    private long _timerGeneration;
     private int _disposed;
     private int _disposeSetupCompleted;
     private int _primitivesDisposed;
@@ -65,6 +71,9 @@ internal sealed class SynchronizationService : IDisposable
             State.InvoiceDownloadAttemptsUtc = persistedAttempts;
         else
             store.SaveDownloadAttempts(State.InvoiceDownloadAttemptsUtc);
+        var persistedMetadataAttempts = store.LoadMetadataAttempts();
+        _metadataRequestAttemptsUtc = persistedMetadataAttempts ?? new List<DateTimeOffset>();
+        if (persistedMetadataAttempts is null) store.SaveMetadataAttempts(_metadataRequestAttemptsUtc);
 
         var normalizedNip = NipValidator.IsValid(_settings.Nip) ? NipValidator.Normalize(_settings.Nip) : string.Empty;
         var stateChanged = State.BindToContext(normalizedNip);
@@ -199,7 +208,7 @@ internal sealed class SynchronizationService : IDisposable
 
         obsoleteConfiguration?.Cancel();
         obsoleteConfiguration?.Dispose();
-        if (contextChanged) StateChanged?.Invoke(this, EventArgs.Empty);
+        if (contextChanged) RaiseStateChanged();
 
         if (connectionChanged && synchronizing)
         {
@@ -235,7 +244,7 @@ internal sealed class SynchronizationService : IDisposable
             await _syncGate.WaitAsync(operationToken).ConfigureAwait(false);
             gateEntered = true;
             Volatile.Write(ref _isSynchronizing, 1);
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            RaiseStateChanged();
 
             KsefApiClient client;
             lock (_configurationGate)
@@ -248,7 +257,10 @@ internal sealed class SynchronizationService : IDisposable
                 if (_client is null || _clientConfigurationVersion != configurationVersionAtStart)
                 {
                     _client?.Dispose();
-                    _client = new KsefApiClient(_settings, _token);
+                    _client = new KsefApiClient(
+                        _settings,
+                        _token,
+                        metadataRequestReservation: ReserveMetadataRequestAsync);
                     _clientConfigurationVersion = configurationVersionAtStart;
                 }
                 client = _client;
@@ -262,12 +274,32 @@ internal sealed class SynchronizationService : IDisposable
                     return (Invoice: (StoredInvoice?)null, RetryAtUtc: (DateTimeOffset?)null, Exists: false);
                 if (!string.IsNullOrWhiteSpace(invoice.Xml))
                     return (Invoice: invoice.Snapshot(), RetryAtUtc: (DateTimeOffset?)null, Exists: true);
-                return (Invoice: (StoredInvoice?)null, RetryAtUtc: ReserveInvoiceDownloadLocked(), Exists: true);
+                return (Invoice: (StoredInvoice?)null, RetryAtUtc: ReserveInvoiceDownloadLocked(invoice), Exists: true);
             }, downloadToken);
 
             if (!prepared.Exists) return null;
             if (prepared.Invoice is not null) return prepared.Invoice;
-            if (prepared.RetryAtUtc is { } retryAtUtc) throw new InvoiceContentPendingException(retryAtUtc);
+            if (prepared.RetryAtUtc is { } retryAtUtc)
+            {
+                // Dla krótkiego odstępu technicznego czekamy w tej samej operacji,
+                // aby seria otwartych okien nie przekroczyła 16 pobrań XML/min.
+                var pacingDelay = retryAtUtc - DateTimeOffset.UtcNow;
+                if (pacingDelay > TimeSpan.Zero && pacingDelay <= InvoiceDownloadInterval)
+                {
+                    await Task.Delay(pacingDelay, downloadToken).ConfigureAwait(false);
+                    prepared = WithCurrentConfiguration(configurationVersionAtStart, () =>
+                    {
+                        if (!State.Invoices.TryGetValue(ksefNumber, out var invoice))
+                            return (Invoice: (StoredInvoice?)null, RetryAtUtc: (DateTimeOffset?)null, Exists: false);
+                        if (!string.IsNullOrWhiteSpace(invoice.Xml))
+                            return (Invoice: invoice.Snapshot(), RetryAtUtc: (DateTimeOffset?)null, Exists: true);
+                        return (Invoice: (StoredInvoice?)null, RetryAtUtc: ReserveInvoiceDownloadLocked(invoice), Exists: true);
+                    }, downloadToken);
+                    if (!prepared.Exists) return null;
+                    if (prepared.Invoice is not null) return prepared.Invoice;
+                }
+                if (prepared.RetryAtUtc is { } remainingRetryAt) throw new InvoiceContentPendingException(remainingRetryAt);
+            }
 
             SetStatus("Pobieranie pełnej treści faktury…");
             _log.Info("Pobieranie faktur", $"Rozpoczęto priorytetowe pobieranie treści faktury {ksefNumber}.");
@@ -280,13 +312,15 @@ internal sealed class SynchronizationService : IDisposable
             {
                 if (!State.Invoices.TryGetValue(ksefNumber, out var invoice)) return null;
                 invoice.Xml = xml;
+                invoice.XmlDownloadFailureCount = 0;
+                invoice.NextXmlDownloadAttemptUtc = null;
                 persistence = _store.SaveStateAsync(State);
                 return invoice.Snapshot();
             }, downloadToken);
             await persistence.ConfigureAwait(false);
             _log.Info("Pobieranie faktur", $"Zapisano pełną treść faktury {ksefNumber} w lokalnej pamięci.");
             SetStatus("Pełna treść faktury jest gotowa.");
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            RaiseStateChanged();
             return refreshed;
         }
         catch (InvoiceContentPendingException exception)
@@ -307,9 +341,12 @@ internal sealed class SynchronizationService : IDisposable
         {
             _log.Warning("Pobieranie faktur", "Nie udało się priorytetowo pobrać pełnej treści faktury.", exception);
             SetStatus(UserFacingErrors.ForSynchronization(exception), StatusSeverity.Error);
-            if (exception.StatusCode == HttpStatusCode.TooManyRequests)
+            RecordInvoiceXmlFailure(configurationVersionAtStart, ksefNumber, exception);
+            if (exception.StatusCode == HttpStatusCode.TooManyRequests ||
+                exception.RetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero)
             {
                 RecordInvoiceDownloadBlock(configurationVersionAtStart, exception.RetryAfter);
+                RecordApiBlock(exception.RetryAfter);
                 Schedule(MaxDelay(SyncInterval, exception.RetryAfter));
             }
             throw;
@@ -342,13 +379,13 @@ internal sealed class SynchronizationService : IDisposable
                     _clientConfigurationVersion = -1;
                 }
             }
+            CompleteOperation();
             if (configurationChanged && !IsDisposed)
             {
                 SetStatus("Zastosowano nowe ustawienia. Rozpoczynanie synchronizacji…");
                 Start();
             }
-            StateChanged?.Invoke(this, EventArgs.Empty);
-            CompleteOperation();
+            RaiseStateChanged();
         }
     }
 
@@ -363,7 +400,7 @@ internal sealed class SynchronizationService : IDisposable
             persistence = _store.SaveStateAsync(State);
         }
         ObserveBackgroundPersistence(persistence);
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
     }
 
     public void MarkNotified(IEnumerable<string> ksefNumbers)
@@ -387,6 +424,7 @@ internal sealed class SynchronizationService : IDisposable
 
     private async void TimerElapsed(object? state)
     {
+        if (state is not long generation || !TryConsumeTimer(generation)) return;
         try
         {
             await SynchronizeAsync(manual: false, _shutdownToken).ConfigureAwait(false);
@@ -394,6 +432,12 @@ internal sealed class SynchronizationService : IDisposable
         catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested)
         {
             // Zamykanie aplikacji.
+        }
+        catch (Exception exception)
+        {
+            _log.Error("Synchronizacja", "Nieoczekiwany błąd automatycznej synchronizacji KSeF.", exception);
+            SetStatus("Nie udało się odświeżyć faktur. Aplikacja spróbuje ponownie za 15 minut.", StatusSeverity.Error);
+            if (!IsDisposed) Schedule(FailureRetryInterval);
         }
     }
 
@@ -418,9 +462,9 @@ internal sealed class SynchronizationService : IDisposable
             return;
         }
 
+        CancelTimerWithoutNotification();
         _log.Info("Synchronizacja", manual ? "Rozpoczęto ręczne odświeżanie faktur." : "Rozpoczęto automatyczne odświeżanie faktur.");
-        lock (_scheduleGate) _nextScheduledSyncUtc = null;
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
         var configurationVersionAtStart = -1;
         var configurationToken = CancellationToken.None;
         CancellationTokenSource? linkedCancellation = null;
@@ -437,13 +481,38 @@ internal sealed class SynchronizationService : IDisposable
                 if (_client is null || _clientConfigurationVersion != configurationVersionAtStart)
                 {
                     _client?.Dispose();
-                    _client = new KsefApiClient(_settings, _token);
+                    _client = new KsefApiClient(
+                        _settings,
+                        _token,
+                        metadataRequestReservation: ReserveMetadataRequestAsync);
                     _clientConfigurationVersion = configurationVersionAtStart;
                 }
                 client = _client;
             }
             linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, configurationToken);
             var syncToken = linkedCancellation.Token;
+            var apiRetryAt = WithCurrentConfiguration(configurationVersionAtStart, () =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (State.ApiBlockedUntilUtc is not { } blockedUntil) return (DateTimeOffset?)null;
+                if (blockedUntil > now) return blockedUntil;
+                State.ApiBlockedUntilUtc = null;
+                _store.SaveState(State);
+                return null;
+            }, syncToken);
+            if (apiRetryAt is { } retryAt)
+            {
+                var retryAfter = retryAt - DateTimeOffset.UtcNow;
+                if (retryAfter < TimeSpan.Zero) retryAfter = TimeSpan.Zero;
+                Schedule(MaxDelay(SyncInterval, retryAfter));
+                if (manual)
+                    throw new KsefApiException(
+                        $"KSeF poprosił o przerwę w wysyłaniu zapytań. Spróbuj ponownie po {retryAt.ToLocalTime():HH:mm}.",
+                        HttpStatusCode.TooManyRequests,
+                        retryAfter: retryAfter);
+                return;
+            }
+            EnsureApiRequestsAllowed();
             SetStatus("Łączenie z KSeF…");
 
             var queryPlan = WithCurrentConfiguration(configurationVersionAtStart, () =>
@@ -488,82 +557,23 @@ internal sealed class SynchronizationService : IDisposable
                 _store.SaveState(State);
                 return added.Select(invoice => invoice.Snapshot()).ToList();
             }, syncToken);
-            StateChanged?.Invoke(this, EventArgs.Empty);
+            RaiseStateChanged();
 
-            var downloadNow = DateTimeOffset.UtcNow;
-            var downloadWindowStart = downloadNow.AddHours(-1);
-            var downloadWindowFutureLimit = downloadNow.AddMinutes(5);
-            var pendingXml = WithCurrentConfiguration(configurationVersionAtStart, () =>
-            {
-                if (State.InvoiceDownloadBlockedUntilUtc is { } blockedUntilUtc)
-                {
-                    if (blockedUntilUtc > downloadNow) return new List<StoredInvoice>();
-                    State.InvoiceDownloadBlockedUntilUtc = null;
-                }
-                State.InvoiceDownloadAttemptsUtc.RemoveAll(x => x <= downloadWindowStart || x > downloadWindowFutureLimit);
-                var availableDownloads = Math.Max(0, MaxInvoiceDownloadsPerHour - State.InvoiceDownloadAttemptsUtc.Count);
-                return State.Invoices.Values
-                    .Where(x => string.IsNullOrWhiteSpace(x.Xml))
-                    .OrderByDescending(x => x.IsNew)
-                    .ThenBy(x => x.DiscoveredAtUtc)
-                    .Take(availableDownloads)
-                    .ToList();
-            }, syncToken);
-
-            var xmlFailures = 0;
-            TimeSpan? xmlRetryAfter = null;
-            for (var index = 0; index < pendingXml.Count; index++)
-            {
-                syncToken.ThrowIfCancellationRequested();
-                if (index > 0) await Task.Delay(TimeSpan.FromSeconds(4), syncToken).ConfigureAwait(false);
-                var invoice = pendingXml[index];
-                SetStatus($"Pobieranie treści faktur: {index + 1}/{pendingXml.Count}…");
-                WithCurrentConfiguration(configurationVersionAtStart, () =>
-                {
-                    State.InvoiceDownloadAttemptsUtc.Add(DateTimeOffset.UtcNow);
-                    _store.SaveDownloadAttempts(State.InvoiceDownloadAttemptsUtc);
-                }, syncToken);
-                try
-                {
-                    var xml = await client.DownloadInvoiceXmlAsync(invoice.KsefNumber, syncToken).ConfigureAwait(false);
-                    syncToken.ThrowIfCancellationRequested();
-                    WithCurrentConfiguration(configurationVersionAtStart, () =>
-                    {
-                        invoice.Xml = xml;
-                        if ((index + 1) % 5 == 0 || index == pendingXml.Count - 1)
-                            _store.SaveState(State);
-                    }, syncToken);
-                }
-                catch (KsefApiException exception) when (exception.StatusCode == HttpStatusCode.TooManyRequests)
-                {
-                    xmlFailures += pendingXml.Count - index;
-                    xmlRetryAfter = exception.RetryAfter;
-                    RecordInvoiceDownloadBlock(configurationVersionAtStart, exception.RetryAfter);
-                    _log.Warning("Pobieranie faktur", "KSeF ograniczył pobieranie treści faktur. Kolejka zostanie wznowiona później.", exception);
-                    break;
-                }
-                catch (KsefApiException exception)
-                {
-                    // Metadane pozostają dostępne. XML zostanie ponowiony w następnym cyklu.
-                    xmlFailures++;
-                    _log.Warning("Pobieranie faktur", "Nie udało się pobrać treści jednej faktury. Metadane pozostały dostępne.", exception);
-                }
-            }
+            // Pełny XML jest potrzebny dopiero do podglądu dokumentu. Pobieramy go
+            // na kliknięcie faktury, więc automatyczne odświeżanie pozostaje lekkie
+            // niezależnie od liczby dokumentów w czteromiesięcznej historii.
 
             WithCurrentConfiguration(configurationVersionAtStart, () =>
             {
                 State.LastSuccessfulSyncUtc = DateTimeOffset.UtcNow;
                 _store.SaveState(State);
             }, syncToken);
-            var remainingXmlCount = WithCurrentConfiguration(configurationVersionAtStart, () =>
-                State.Invoices.Values.Count(invoice => string.IsNullOrWhiteSpace(invoice.Xml)), syncToken);
             var listStatus = newInvoices.Count == 0 ? "Brak nowych faktur." : $"Nowe faktury: {newInvoices.Count}.";
-            var xmlStatus = remainingXmlCount == 0 ? string.Empty : $" Treść {remainingXmlCount} faktur oczekuje na pobranie.";
-            SetStatus($"{listStatus}{xmlStatus} Odświeżono {DateTime.Now:HH:mm}.");
-            _log.Info("Synchronizacja", $"Zakończono odświeżanie. Nowe faktury: {newInvoices.Count}; błędy pobierania XML: {xmlFailures}; oczekujące treści XML: {remainingXmlCount}.");
-            StateChanged?.Invoke(this, EventArgs.Empty);
-            if (newInvoices.Count > 0) NewInvoicesDiscovered?.Invoke(this, newInvoices);
-            Schedule(MaxDelay(SyncInterval, xmlRetryAfter));
+            SetStatus($"{listStatus} Odświeżono {DateTime.Now:HH:mm}.");
+            _log.Info("Synchronizacja", $"Zakończono odświeżanie. Nowe faktury: {newInvoices.Count}. Pełny XML jest pobierany dopiero po otwarciu faktury.");
+            RaiseStateChanged();
+            if (newInvoices.Count > 0) RaiseNewInvoicesDiscovered(newInvoices);
+            Schedule(SyncInterval);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -579,6 +589,9 @@ internal sealed class SynchronizationService : IDisposable
         {
             _log.Error("Synchronizacja", "KSeF zwrócił błąd podczas odświeżania faktur.", exception);
             SetStatus(UserFacingErrors.ForSynchronization(exception), StatusSeverity.Error);
+            if (exception.StatusCode == HttpStatusCode.TooManyRequests ||
+                exception.RetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero)
+                RecordApiBlock(exception.RetryAfter);
             Schedule(MaxDelay(FailureRetryInterval, exception.RetryAfter));
             if (manual) throw;
         }
@@ -609,13 +622,13 @@ internal sealed class SynchronizationService : IDisposable
                     _clientConfigurationVersion = -1;
                 }
             }
+            CompleteOperation();
             if (configurationChanged && !IsDisposed)
             {
                 SetStatus("Zastosowano nowe ustawienia. Rozpoczynanie synchronizacji…");
                 Start();
             }
-            StateChanged?.Invoke(this, EventArgs.Empty);
-            CompleteOperation();
+            RaiseStateChanged();
         }
     }
 
@@ -656,23 +669,72 @@ internal sealed class SynchronizationService : IDisposable
         foreach (var key in obsolete) State.Invoices.Remove(key);
     }
 
-    private DateTimeOffset? ReserveInvoiceDownloadLocked()
+    private DateTimeOffset? ReserveInvoiceDownloadLocked(StoredInvoice invoice)
     {
         var now = DateTimeOffset.UtcNow;
+        DateTimeOffset? retryAt = invoice.NextXmlDownloadAttemptUtc is { } invoiceRetryAt && invoiceRetryAt > now
+            ? invoiceRetryAt
+            : null;
+        if (State.ApiBlockedUntilUtc is { } apiBlockedUntil && apiBlockedUntil > now &&
+            (retryAt is null || apiBlockedUntil > retryAt))
+            retryAt = apiBlockedUntil;
         if (State.InvoiceDownloadBlockedUntilUtc is { } blockedUntilUtc)
         {
-            if (blockedUntilUtc > now) return blockedUntilUtc;
-            State.InvoiceDownloadBlockedUntilUtc = null;
+            if (blockedUntilUtc > now && (retryAt is null || blockedUntilUtc > retryAt))
+                retryAt = blockedUntilUtc;
+            else if (blockedUntilUtc <= now)
+                State.InvoiceDownloadBlockedUntilUtc = null;
         }
         var windowStart = now.AddHours(-1);
         var futureLimit = now.AddMinutes(5);
         State.InvoiceDownloadAttemptsUtc.RemoveAll(x => x <= windowStart || x > futureLimit);
         if (State.InvoiceDownloadAttemptsUtc.Count >= MaxInvoiceDownloadsPerHour)
-            return State.InvoiceDownloadAttemptsUtc.Min().AddHours(1).AddSeconds(1);
+        {
+            var limitRetryAt = State.InvoiceDownloadAttemptsUtc.Min().AddHours(1).AddSeconds(1);
+            if (retryAt is null || limitRetryAt > retryAt) retryAt = limitRetryAt;
+        }
+        if (GetInvoiceDownloadPacingRetryAtLocked(now) is { } pacingRetryAt &&
+            (retryAt is null || pacingRetryAt > retryAt))
+            retryAt = pacingRetryAt;
+
+        if (retryAt is not null) return retryAt;
 
         State.InvoiceDownloadAttemptsUtc.Add(now);
+        State.LastInvoiceDownloadAttemptUtc = now;
         _store.SaveDownloadAttempts(State.InvoiceDownloadAttemptsUtc);
         return null;
+    }
+
+    private DateTimeOffset? GetInvoiceDownloadPacingRetryAtLocked(DateTimeOffset now)
+    {
+        if (State.LastInvoiceDownloadAttemptUtc is not { } lastAttempt) return null;
+        if (lastAttempt > now.AddMinutes(5) || lastAttempt < now.AddHours(-1))
+        {
+            State.LastInvoiceDownloadAttemptUtc = null;
+            return null;
+        }
+        var retryAt = lastAttempt + InvoiceDownloadInterval;
+        return retryAt > now ? retryAt : null;
+    }
+
+    private void RecordInvoiceXmlFailure(int configurationVersion, string ksefNumber, KsefApiException exception)
+    {
+        if (configurationVersion < 0) return;
+        lock (_configurationGate)
+        {
+            if (configurationVersion != _configurationVersion) return;
+            lock (_stateGate)
+            {
+                if (!State.Invoices.TryGetValue(ksefNumber, out var invoice) ||
+                    !string.IsNullOrWhiteSpace(invoice.Xml)) return;
+                invoice.XmlDownloadFailureCount = Math.Min(invoice.XmlDownloadFailureCount + 1, 1000);
+                invoice.NextXmlDownloadAttemptUtc = DateTimeOffset.UtcNow + KsefXmlDownloadPolicy.GetRetryDelay(
+                    invoice.XmlDownloadFailureCount,
+                    exception.StatusCode,
+                    exception.RetryAfter);
+                _store.SaveState(State);
+            }
+        }
     }
 
     private void RecordInvoiceDownloadBlock(int configurationVersion, TimeSpan? retryAfter)
@@ -697,6 +759,29 @@ internal sealed class SynchronizationService : IDisposable
         }
     }
 
+    private void RecordApiBlock(TimeSpan? retryAfter)
+    {
+        try
+        {
+            var delay = retryAfter is { } serverDelay && serverDelay > TimeSpan.Zero
+                ? serverDelay
+                : SyncInterval;
+            var blockedUntilUtc = DateTimeOffset.UtcNow + delay;
+            lock (_stateGate)
+            {
+                if (State.ApiBlockedUntilUtc is null || blockedUntilUtc > State.ApiBlockedUntilUtc)
+                {
+                    State.ApiBlockedUntilUtc = blockedUntilUtc;
+                    _store.SaveState(State);
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            _log.Error("Synchronizacja", "Nie udało się zapisać czasu blokady API KSeF.", exception);
+        }
+    }
+
     private void RegisterOperation(CancellationToken cancellationToken)
     {
         lock (_lifecycleGate)
@@ -705,6 +790,86 @@ internal sealed class SynchronizationService : IDisposable
             if (IsDisposed) throw new OperationCanceledException("Aplikacja jest zamykana.", cancellationToken);
             _activeOperations++;
         }
+    }
+
+    internal async Task ReserveMetadataRequestAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            TimeSpan delay;
+            lock (_stateGate)
+            {
+                var now = DateTimeOffset.UtcNow;
+                ThrowIfApiBlockedLocked(now);
+                ThrowIfMetadataBudgetExhaustedLocked(now);
+
+                var latestAttempt = _metadataRequestAttemptsUtc.Count == 0
+                    ? (DateTimeOffset?)null
+                    : _metadataRequestAttemptsUtc.Max();
+                var nextAllowedUtc = latestAttempt is { } latest
+                    ? latest + MetadataRequestInterval
+                    : now;
+                delay = nextAllowedUtc - now;
+                if (delay <= TimeSpan.Zero)
+                {
+                    _metadataRequestAttemptsUtc.Add(now);
+                    _store.SaveMetadataAttempts(_metadataRequestAttemptsUtc);
+                    return;
+                }
+            }
+
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    internal void EnsureApiRequestsAllowed()
+    {
+        lock (_stateGate)
+        {
+            var now = DateTimeOffset.UtcNow;
+            ThrowIfApiBlockedLocked(now);
+            ThrowIfMetadataBudgetExhaustedLocked(now);
+        }
+    }
+
+    internal void RecordApiCooldown(KsefApiException exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+        if (exception.StatusCode == HttpStatusCode.TooManyRequests ||
+            exception.RetryAfter is { } retryAfter && retryAfter > TimeSpan.Zero)
+            RecordApiBlock(exception.RetryAfter);
+    }
+
+    private void ThrowIfApiBlockedLocked(DateTimeOffset now)
+    {
+        if (State.ApiBlockedUntilUtc is not { } blockedUntilUtc) return;
+        if (blockedUntilUtc <= now)
+        {
+            State.ApiBlockedUntilUtc = null;
+            return;
+        }
+
+        throw new KsefApiException(
+            $"KSeF poprosił o przerwę w wysyłaniu zapytań do {blockedUntilUtc:O}.",
+            HttpStatusCode.TooManyRequests,
+            retryAfter: blockedUntilUtc - now);
+    }
+
+    private void ThrowIfMetadataBudgetExhaustedLocked(DateTimeOffset now)
+    {
+        var windowStart = now.AddHours(-1);
+        var futureLimit = now.AddMinutes(5);
+        _metadataRequestAttemptsUtc.RemoveAll(attempt => attempt <= windowStart || attempt > futureLimit);
+        if (_metadataRequestAttemptsUtc.Count < MaxMetadataRequestsPerHour) return;
+
+        var retryAtUtc = _metadataRequestAttemptsUtc.Min().AddHours(1).AddSeconds(1);
+        var retryAfter = retryAtUtc - now;
+        if (retryAfter < TimeSpan.Zero) retryAfter = TimeSpan.Zero;
+        throw new KsefApiException(
+            "Aplikacja wykorzystała bezpieczny godzinowy limit zapytań o listę faktur.",
+            HttpStatusCode.TooManyRequests,
+            retryAfter: retryAfter);
     }
 
     private void CompleteOperation()
@@ -753,28 +918,99 @@ internal sealed class SynchronizationService : IDisposable
     {
         if (IsDisposed || _shutdownToken.IsCancellationRequested) return;
         if (due < TimeSpan.Zero) due = TimeSpan.Zero;
+        if (due > MaximumTimerDue) due = MaximumTimerDue;
         lock (_scheduleGate)
         {
+            if (IsDisposed || _shutdownToken.IsCancellationRequested) return;
             _nextScheduledSyncUtc = DateTimeOffset.UtcNow + due;
             _timer?.Dispose();
-            _timer = new Timer(TimerElapsed, null, due, Timeout.InfiniteTimeSpan);
+            var generation = ++_timerGeneration;
+            _timer = new Timer(TimerElapsed, generation, due, Timeout.InfiniteTimeSpan);
         }
-        StateChanged?.Invoke(this, EventArgs.Empty);
+        RaiseStateChanged();
     }
 
     private void CancelScheduledSync()
     {
+        CancelTimerWithoutNotification();
+        RaiseStateChanged();
+    }
+
+    private void CancelTimerWithoutNotification()
+    {
         lock (_scheduleGate)
         {
+            _timerGeneration++;
             _nextScheduledSyncUtc = null;
             _timer?.Dispose();
             _timer = null;
         }
-        StateChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    private void SetStatus(string status, StatusSeverity severity = StatusSeverity.Information) =>
-        StatusChanged?.Invoke(this, new AppStatusMessage(status, severity));
+    private bool TryConsumeTimer(long generation)
+    {
+        lock (_scheduleGate)
+        {
+            if (generation != _timerGeneration || IsDisposed) return false;
+            _timerGeneration++;
+            _nextScheduledSyncUtc = null;
+            _timer?.Dispose();
+            _timer = null;
+            return true;
+        }
+    }
+
+    private void RaiseStateChanged()
+    {
+        var handlers = StateChanged;
+        if (handlers is null) return;
+        foreach (EventHandler handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, EventArgs.Empty);
+            }
+            catch (Exception exception)
+            {
+                _log.Warning("Interfejs", "Odbiorca zmiany stanu synchronizacji KSeF zgłosił błąd.", exception);
+            }
+        }
+    }
+
+    private void RaiseNewInvoicesDiscovered(IReadOnlyList<StoredInvoice> invoices)
+    {
+        var handlers = NewInvoicesDiscovered;
+        if (handlers is null) return;
+        foreach (EventHandler<IReadOnlyList<StoredInvoice>> handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, invoices);
+            }
+            catch (Exception exception)
+            {
+                _log.Warning("Interfejs", "Odbiorca powiadomienia o nowych fakturach zgłosił błąd.", exception);
+            }
+        }
+    }
+
+    private void SetStatus(string status, StatusSeverity severity = StatusSeverity.Information)
+    {
+        var handlers = StatusChanged;
+        if (handlers is null) return;
+        var message = new AppStatusMessage(status, severity);
+        foreach (EventHandler<AppStatusMessage> handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, message);
+            }
+            catch (Exception exception)
+            {
+                _log.Warning("Interfejs", "Odbiorca komunikatu synchronizacji KSeF zgłosił błąd.", exception);
+            }
+        }
+    }
 
     private void ObserveBackgroundPersistence(Task persistence)
     {
@@ -797,12 +1033,7 @@ internal sealed class SynchronizationService : IDisposable
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         }
         _shutdown.Cancel();
-        lock (_scheduleGate)
-        {
-            _timer?.Dispose();
-            _timer = null;
-            _nextScheduledSyncUtc = null;
-        }
+        CancelTimerWithoutNotification();
         lock (_configurationGate)
         {
             _configurationChanged.Cancel();
