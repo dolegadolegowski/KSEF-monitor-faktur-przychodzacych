@@ -15,6 +15,7 @@ namespace KsefMonitor;
 internal sealed class SettingsWindow : Window
 {
     private readonly AppStore _store;
+    private readonly SynchronizationService _synchronization;
     private readonly MyDrSynchronizationService _myDr;
     private readonly AppUpdateService _updates;
     private readonly TextBox _nip = new();
@@ -52,9 +53,14 @@ internal sealed class SettingsWindow : Window
     private bool _myDrStatusReadFailed;
     private bool _isClosing;
 
-    public SettingsWindow(AppStore store, MyDrSynchronizationService myDr, AppUpdateService updates)
+    public SettingsWindow(
+        AppStore store,
+        SynchronizationService synchronization,
+        MyDrSynchronizationService myDr,
+        AppUpdateService updates)
     {
         _store = store;
+        _synchronization = synchronization;
         _myDr = myDr;
         _updates = updates;
         Title = "Ustawienia aplikacji";
@@ -80,6 +86,7 @@ internal sealed class SettingsWindow : Window
         {
             _isClosing = true;
             _testCancellation?.Cancel();
+            _myDrCancellation?.Cancel();
             _myDrStatusTimer.Stop();
             _updates.StateChanged -= OnUpdateStateChanged;
         };
@@ -297,6 +304,7 @@ internal sealed class SettingsWindow : Window
         actions.Children.Add(_myDrSaveButton);
 
         _myDrRefreshButton.Content = "Odśwież teraz";
+        _myDrRefreshButton.ToolTip = "Pełne przeliczenie czterech miesięcy. Może wykonać po jednym zapytaniu o usługi dla każdej rozliczonej wizyty.";
         _myDrRefreshButton.Padding = new Thickness(14, 7, 14, 7);
         _myDrRefreshButton.Margin = new Thickness(0, 0, 10, 8);
         _myDrRefreshButton.Click += async (_, _) => await RefreshMyDrNowAsync().ConfigureAwait(true);
@@ -439,7 +447,7 @@ internal sealed class SettingsWindow : Window
     {
         try
         {
-            await _updates.CheckForUpdatesAsync(force: true).ConfigureAwait(true);
+            await _updates.CheckForUpdatesAsync(force: false).ConfigureAwait(true);
         }
         catch (Exception exception)
         {
@@ -775,7 +783,10 @@ internal sealed class SettingsWindow : Window
             else SetMyDrActionStatus("Pobieranie obrotu z MyDR…", isError: false);
 
             SetMyDrBusy(true);
-            timeout = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            // Pierwsze przeliczenie może objąć cztery miesiące. Klient celowo
+            // rozkłada żądania w czasie, dlatego nie przerywamy bezpiecznego
+            // pobierania po dawnych pięciu minutach.
+            timeout = new CancellationTokenSource(TimeSpan.FromMinutes(30));
             _myDrCancellation = timeout;
             await _myDr.RefreshNowAsync(timeout.Token).ConfigureAwait(true);
             if (!_isClosing)
@@ -790,8 +801,8 @@ internal sealed class SettingsWindow : Window
         }
         catch (OperationCanceledException) when (timeout?.IsCancellationRequested == true)
         {
-            SetMyDrActionStatus("MyDR nie odpowiedział w ciągu pięciu minut. Spróbuj ponownie później.", isError: true);
-            _store.Log.Warning("Ustawienia MyDR", "Ręczne odświeżanie MyDR przekroczyło limit pięciu minut.", new TimeoutException("MyDR nie odpowiedział w ciągu pięciu minut."));
+            SetMyDrActionStatus("Pobieranie z MyDR trwało ponad 30 minut. Spróbuj ponownie później.", isError: true);
+            _store.Log.Warning("Ustawienia MyDR", "Ręczne odświeżanie MyDR przekroczyło limit 30 minut.", new TimeoutException("MyDR nie odpowiedział w ciągu 30 minut."));
         }
         catch (OperationCanceledException)
         {
@@ -932,7 +943,11 @@ internal sealed class SettingsWindow : Window
         _testCancellation = timeout;
         try
         {
-            using var client = new KsefApiClient(ReadSettings(), token);
+            _synchronization.EnsureApiRequestsAllowed();
+            using var client = new KsefApiClient(
+                ReadSettings(),
+                token,
+                metadataRequestReservation: _synchronization.ReserveMetadataRequestAsync);
             await client.AuthenticateAsync(timeout.Token).ConfigureAwait(true);
             SetStatus("Sprawdzanie uprawnienia InvoiceRead…", isError: false);
             await client.VerifyInvoiceReadAccessAsync(timeout.Token).ConfigureAwait(true);
@@ -947,6 +962,12 @@ internal sealed class SettingsWindow : Window
         {
             SetStatus("Przekroczono minutę oczekiwania na odpowiedź KSeF. Spróbuj ponownie.", isError: true);
             _store.Log.Warning("Ustawienia", "Test połączenia z KSeF przekroczył limit jednej minuty.", new TimeoutException("KSeF nie odpowiedział w ciągu jednej minuty."));
+        }
+        catch (KsefApiException exception)
+        {
+            _synchronization.RecordApiCooldown(exception);
+            _store.Log.Error("Ustawienia", "Test połączenia z KSeF nie powiódł się.", exception);
+            if (!_isClosing) SetStatus(UserFacingErrors.ForConnectionTest(exception), isError: true);
         }
         catch (Exception exception)
         {

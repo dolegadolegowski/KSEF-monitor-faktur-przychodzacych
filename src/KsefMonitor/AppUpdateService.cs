@@ -10,10 +10,13 @@ internal sealed class AppUpdateService : IDisposable
 {
     private static readonly TimeSpan MetadataTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan InstallationTimeout = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan AutomaticCheckInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DefaultForcedCheckMinimumInterval = TimeSpan.FromMinutes(1);
     private readonly ApplicationLog _log;
     private readonly GitHubUpdateClient _client;
     private readonly string? _processPath;
     private readonly SemanticVersion _currentVersion;
+    private readonly TimeSpan _forcedCheckMinimumInterval;
     private readonly object _stateGate = new();
     private readonly SemaphoreSlim _operationSemaphore = new(1, 1);
     private readonly CancellationTokenSource _lifetime = new();
@@ -21,6 +24,8 @@ internal sealed class AppUpdateService : IDisposable
     private GitHubReleaseInfo? _cachedRelease;
     private string? _etag;
     private long _checkGeneration;
+    private DateTimeOffset? _lastCheckAttemptUtc;
+    private DateTimeOffset? _blockedUntilUtc;
     private int _installationInProgress;
     private bool _installationHandedOff;
     private bool _disposed;
@@ -29,12 +34,15 @@ internal sealed class AppUpdateService : IDisposable
         ApplicationLog log,
         GitHubUpdateClient? client = null,
         string? processPath = null,
-        SemanticVersion? currentVersion = null)
+        SemanticVersion? currentVersion = null,
+        TimeSpan? forcedCheckMinimumInterval = null)
     {
         _log = log;
         _client = client ?? new GitHubUpdateClient();
         _processPath = processPath ?? Environment.ProcessPath;
         _currentVersion = currentVersion ?? ProductInformation.CurrentVersion;
+        _forcedCheckMinimumInterval = forcedCheckMinimumInterval ?? DefaultForcedCheckMinimumInterval;
+        ArgumentOutOfRangeException.ThrowIfLessThan(_forcedCheckMinimumInterval, TimeSpan.Zero);
         _snapshot = new AppUpdateSnapshot(_currentVersion, AppUpdatePhase.Idle);
     }
 
@@ -56,8 +64,25 @@ internal sealed class AppUpdateService : IDisposable
             if (Volatile.Read(ref _installationInProgress) != 0) return GetSnapshot();
             if (observedGeneration != Interlocked.Read(ref _checkGeneration)) return GetSnapshot();
             var previous = GetSnapshot();
-            if (!force && previous.LastCheckedUtc is { } recent && DateTimeOffset.UtcNow - recent < TimeSpan.FromMinutes(5))
-                return previous;
+            var now = DateTimeOffset.UtcNow;
+            if (_blockedUntilUtc is { } blockedUntilUtc)
+            {
+                if (blockedUntilUtc > now) return previous;
+                _blockedUntilUtc = null;
+            }
+            var minimumInterval = force ? _forcedCheckMinimumInterval : AutomaticCheckInterval;
+            if (_lastCheckAttemptUtc is { } recentAttempt)
+            {
+                var sinceAttempt = now - recentAttempt;
+                if (sinceAttempt >= TimeSpan.Zero && sinceAttempt < minimumInterval) return previous;
+            }
+            if (!force && previous.LastCheckedUtc is { } recentSuccess)
+            {
+                var sinceSuccess = now - recentSuccess;
+                if (sinceSuccess >= TimeSpan.Zero && sinceSuccess < AutomaticCheckInterval) return previous;
+            }
+
+            _lastCheckAttemptUtc = now;
 
             SetSnapshot(previous with
             {
@@ -71,6 +96,7 @@ internal sealed class AppUpdateService : IDisposable
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
                 timeout.CancelAfter(MetadataTimeout);
                 var result = await _client.GetLatestReleaseAsync(_etag, timeout.Token).ConfigureAwait(false);
+                _blockedUntilUtc = null;
                 if (!result.NotModified)
                 {
                     _cachedRelease = result.Release ?? throw new AppUpdateException(
@@ -81,7 +107,7 @@ internal sealed class AppUpdateService : IDisposable
                 var latest = _cachedRelease ?? throw new AppUpdateException(
                     "Odpowiedź 304 otrzymano bez lokalnego cache wydania.",
                     "Nie udało się ustalić najnowszej wersji aplikacji.");
-                var now = DateTimeOffset.UtcNow;
+                var checkedAtUtc = DateTimeOffset.UtcNow;
                 if (latest.Version.CompareTo(_currentVersion) > 0)
                 {
                     SetSnapshot(new AppUpdateSnapshot(
@@ -89,7 +115,7 @@ internal sealed class AppUpdateService : IDisposable
                         AppUpdatePhase.Available,
                         latest,
                         $"Dostępna jest aktualizacja v{latest.Version}.",
-                        LastCheckedUtc: now));
+                        LastCheckedUtc: checkedAtUtc));
                     _log.Info("Aktualizacja", $"Dostępna jest wersja v{latest.Version}; zainstalowana: v{_currentVersion}.");
                 }
                 else
@@ -98,7 +124,7 @@ internal sealed class AppUpdateService : IDisposable
                         _currentVersion,
                         AppUpdatePhase.UpToDate,
                         Message: "Masz najnowszą wersję aplikacji.",
-                        LastCheckedUtc: now));
+                        LastCheckedUtc: checkedAtUtc));
                     if (latest.Version.CompareTo(_currentVersion) < 0)
                         _log.Warning("Aktualizacja", $"GitHub latest wskazuje starszą wersję v{latest.Version}; downgrade został zablokowany.");
                     else
@@ -125,6 +151,7 @@ internal sealed class AppUpdateService : IDisposable
             }
             catch (AppUpdateException exception)
             {
+                RecordServerBlock(exception);
                 ApplyCheckFailure(exception);
             }
             catch (Exception exception)
@@ -161,6 +188,12 @@ internal sealed class AppUpdateService : IDisposable
                 throw new AppUpdateException(
                     "Nie można rozpocząć instalacji podczas sprawdzania aktualizacji.",
                     "Trwa sprawdzanie aktualizacji. Poczekaj chwilę i kliknij „Aktualizuj” ponownie.");
+
+            if (_blockedUntilUtc is { } blockedUntilUtc && blockedUntilUtc > DateTimeOffset.UtcNow)
+                throw new AppUpdateException(
+                    $"GitHub wstrzymał kolejne żądania do {blockedUntilUtc:O}.",
+                    "GitHub poprosił o przerwę. Spróbuj zainstalować aktualizację później.",
+                    blockedUntilUtc - DateTimeOffset.UtcNow);
 
             var release = GetSnapshot().AvailableRelease;
             if (release is null || release.Version.CompareTo(_currentVersion) <= 0)
@@ -251,6 +284,7 @@ internal sealed class AppUpdateService : IDisposable
         }
         catch (AppUpdateException exception)
         {
+            RecordServerBlock(exception);
             ApplyInstallFailure(exception);
             throw;
         }
@@ -292,6 +326,14 @@ internal sealed class AppUpdateService : IDisposable
             exception.UserMessage,
             LastCheckedUtc: DateTimeOffset.UtcNow,
             HasError: true));
+    }
+
+    private void RecordServerBlock(AppUpdateException exception)
+    {
+        if (exception.RetryAfter is not { } retryAfter || retryAfter <= TimeSpan.Zero) return;
+        var blockedUntilUtc = DateTimeOffset.UtcNow + retryAfter;
+        if (_blockedUntilUtc is null || blockedUntilUtc > _blockedUntilUtc)
+            _blockedUntilUtc = blockedUntilUtc;
     }
 
     private void ApplyInstallFailure(AppUpdateException exception)

@@ -77,6 +77,19 @@ internal sealed class MyDrVisit
     [JsonPropertyName("id")]
     public long Id { get; set; }
 
+    // Pole wymagane przez kontrakt MyDR. Nullable pozwala bezpiecznie pominąć
+    // jeszcze nieprzypisaną wizytę niewykonaną; wykonane wizyty są walidowane
+    // przed agregacją. Grupowanie po ID rozdziela osoby o takim samym nazwisku.
+    [JsonPropertyName("doctor")]
+    [JsonNumberHandling(JsonNumberHandling.AllowReadingFromString)]
+    public long? DoctorId { get; set; }
+
+    [JsonPropertyName("doctor_name")]
+    public string? DoctorName { get; set; }
+
+    [JsonPropertyName("doctor_surname")]
+    public string? DoctorSurname { get; set; }
+
     // API deklaruje format YYYY-MM-DD. Zachowujemy tekst, aby nie zmieniać
     // semantyki stref czasowych i móc odrzucić niepoprawną odpowiedź jawnie.
     [JsonPropertyName("date")]

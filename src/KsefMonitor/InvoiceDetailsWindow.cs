@@ -15,7 +15,7 @@ using System.Windows.Media.Effects;
 namespace KsefMonitor;
 
 [SuppressMessage("Design", "CA1031:Do not catch general exception types", Justification = "Błędy dokumentu i renderowania są prezentowane wewnątrz okna, aby pojedyncza faktura nie zamknęła aplikacji.")]
-internal sealed class InvoiceDetailsWindow : Window
+internal sealed class InvoiceDetailsWindow : Window, IDisposable
 {
     private const double A4Width = 794;
     private const double A4Height = 1123;
@@ -56,11 +56,16 @@ internal sealed class InvoiceDetailsWindow : Window
         Icon = TrayIconFactory.CreateImageSource();
         Content = BuildContent();
         Loaded += OnLoaded;
-        Closed += (_, _) =>
-        {
-            _isClosed = true;
-            _loadCancellation.Cancel();
-        };
+        Closed += (_, _) => Dispose();
+    }
+
+    public void Dispose()
+    {
+        if (_isClosed) return;
+        _isClosed = true;
+        _loadCancellation.Cancel();
+        _loadCancellation.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private Grid BuildContent()

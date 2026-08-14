@@ -19,6 +19,7 @@ internal sealed class KsefApiClient : IDisposable
     // API dopuszcza maksymalnie trzy miesiące. Dwumiesięczne okna zostawiają
     // bezpieczny margines na zmianę czasu i różne offsety strefy Warszawy.
     private const int MetadataQueryWindowMonths = 2;
+    private static readonly TimeSpan DefaultMetadataRequestInterval = TimeSpan.FromSeconds(4);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -28,15 +29,27 @@ internal sealed class KsefApiClient : IDisposable
     private readonly HttpClient _http;
     private readonly HttpMessageHandler _handler;
     private readonly SemaphoreSlim _authGate = new(1, 1);
+    private readonly SemaphoreSlim _metadataPacingGate = new(1, 1);
+    private readonly TimeSpan _metadataRequestInterval;
+    private readonly Func<CancellationToken, Task>? _metadataRequestReservation;
+    private DateTimeOffset _lastMetadataRequestUtc;
     private readonly string _nip;
     private string _ksefToken;
     private TokenInfo? _accessToken;
     private TokenInfo? _refreshToken;
 
-    public KsefApiClient(AppSettings settings, string ksefToken, HttpMessageHandler? handler = null)
+    public KsefApiClient(
+        AppSettings settings,
+        string ksefToken,
+        HttpMessageHandler? handler = null,
+        TimeSpan? metadataRequestInterval = null,
+        Func<CancellationToken, Task>? metadataRequestReservation = null)
     {
         _nip = NipValidator.Normalize(settings.Nip);
         _ksefToken = ksefToken.Trim();
+        _metadataRequestInterval = metadataRequestInterval ?? DefaultMetadataRequestInterval;
+        _metadataRequestReservation = metadataRequestReservation;
+        ArgumentOutOfRangeException.ThrowIfLessThan(_metadataRequestInterval, TimeSpan.Zero);
         _handler = handler ?? CreateDefaultHandler();
         _http = new HttpClient(_handler, disposeHandler: false);
         _http.BaseAddress = AppSettings.GetBaseUri();
@@ -107,7 +120,8 @@ internal sealed class KsefApiClient : IDisposable
                 HttpMethod.Post,
                 $"invoices/query/metadata?sortOrder=Asc&pageOffset={pageOffset}&pageSize=250",
                 body,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                isMetadataRequest: true).ConfigureAwait(false);
 
             using var document = await ParseJsonAsync(response, cancellationToken).ConfigureAwait(false);
             var root = document.RootElement;
@@ -160,9 +174,30 @@ internal sealed class KsefApiClient : IDisposable
             HttpMethod.Post,
             "invoices/query/metadata?sortOrder=Asc&pageOffset=0&pageSize=10",
             body,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            isMetadataRequest: true).ConfigureAwait(false);
         using var document = await ParseJsonAsync(response, cancellationToken).ConfigureAwait(false);
         ValidateMetadataResponse(document.RootElement);
+    }
+
+    private async Task WaitForMetadataRequestSlotAsync(CancellationToken cancellationToken)
+    {
+        await _metadataPacingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (_lastMetadataRequestUtc != default)
+            {
+                var delay = _lastMetadataRequestUtc + _metadataRequestInterval - DateTimeOffset.UtcNow;
+                if (delay > TimeSpan.Zero) await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+            if (_metadataRequestReservation is not null)
+                await _metadataRequestReservation(cancellationToken).ConfigureAwait(false);
+            _lastMetadataRequestUtc = DateTimeOffset.UtcNow;
+        }
+        finally
+        {
+            _metadataPacingGate.Release();
+        }
     }
 
     public async Task<string> DownloadInvoiceXmlAsync(string ksefNumber, CancellationToken cancellationToken)
@@ -170,7 +205,10 @@ internal sealed class KsefApiClient : IDisposable
         var escaped = Uri.EscapeDataString(ksefNumber);
         using var response = await SendAuthorizedAsync(HttpMethod.Get, $"invoices/ksef/{escaped}", null, cancellationToken)
             .ConfigureAwait(false);
-        return await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        var xml = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(xml))
+            throw new KsefApiException("KSeF zwrócił pustą treść faktury.");
+        return xml;
     }
 
     private async Task EnsureAccessTokenAsync(CancellationToken cancellationToken)
@@ -194,8 +232,12 @@ internal sealed class KsefApiClient : IDisposable
                     _accessToken = ParseTokenInfo(json.RootElement.GetProperty("accessToken"));
                     return;
                 }
-                catch (KsefApiException)
+                catch (KsefApiException exception) when (ShouldStartFullAuthentication(exception.StatusCode))
                 {
+                    // Pełny challenge ma sens wyłącznie wtedy, gdy refresh token
+                    // został odrzucony. Błędy chwilowe (429/5xx) muszą trafić do
+                    // harmonogramu razem z Retry-After; wykonanie w tym miejscu
+                    // kolejnych 5+ żądań tylko pogłębiłoby przeciążenie KSeF.
                     _accessToken = null;
                     _refreshToken = null;
                 }
@@ -208,6 +250,9 @@ internal sealed class KsefApiClient : IDisposable
             _authGate.Release();
         }
     }
+
+    private static bool ShouldStartFullAuthentication(HttpStatusCode? statusCode) =>
+        statusCode is HttpStatusCode.BadRequest or HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
 
     private async Task AuthenticateCoreAsync(CancellationToken cancellationToken)
     {
@@ -306,9 +351,12 @@ internal sealed class KsefApiClient : IDisposable
         HttpMethod method,
         string relativeUri,
         object? body,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool isMetadataRequest = false)
     {
         await EnsureAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+        if (isMetadataRequest)
+            await WaitForMetadataRequestSlotAsync(cancellationToken).ConfigureAwait(false);
         using var request = CreateRequest(method, relativeUri, body);
         request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken!.Token);
         var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
@@ -319,6 +367,8 @@ internal sealed class KsefApiClient : IDisposable
             response.Dispose();
             _accessToken = null;
             await EnsureAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+            if (isMetadataRequest)
+                await WaitForMetadataRequestSlotAsync(cancellationToken).ConfigureAwait(false);
             using var retry = CreateRequest(method, relativeUri, body);
             retry.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken!.Token);
             response = await _http.SendAsync(retry, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
@@ -397,7 +447,9 @@ internal sealed class KsefApiClient : IDisposable
         if (root.ValueKind != JsonValueKind.Object ||
             !root.TryGetProperty("hasMore", out var hasMore) || hasMore.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
             !root.TryGetProperty("isTruncated", out var isTruncated) || isTruncated.ValueKind is not (JsonValueKind.True or JsonValueKind.False) ||
-            !root.TryGetProperty("invoices", out var invoices) || invoices.ValueKind != JsonValueKind.Array)
+            !root.TryGetProperty("invoices", out var invoices) || invoices.ValueKind != JsonValueKind.Array ||
+            !root.TryGetProperty("permanentStorageHwmDate", out var hwm) || hwm.ValueKind != JsonValueKind.String ||
+            !DateTimeOffset.TryParse(hwm.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out _))
             throw new KsefApiException("KSeF zwrócił niepełną odpowiedź z listą metadanych faktur.");
     }
 
@@ -607,6 +659,7 @@ internal sealed class KsefApiClient : IDisposable
         _accessToken = null;
         _refreshToken = null;
         _ksefToken = string.Empty;
+        _metadataPacingGate.Dispose();
         _authGate.Dispose();
         _http.Dispose();
         _handler.Dispose();

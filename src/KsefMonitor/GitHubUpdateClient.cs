@@ -1,6 +1,8 @@
 using System;
 using System.Buffers;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -24,6 +26,8 @@ internal sealed record UpdateDownloadProgress(long DownloadedBytes, long TotalBy
 
 internal sealed class GitHubUpdateClient : IDisposable
 {
+    private static readonly TimeSpan DefaultRateLimitDelay = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MaximumRateLimitDelay = TimeSpan.FromDays(1);
     private readonly HttpClient _http;
 
     public GitHubUpdateClient(HttpMessageHandler? handler = null)
@@ -251,27 +255,52 @@ internal sealed class GitHubUpdateClient : IDisposable
         var status = (int)response.StatusCode;
         if (response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.TooManyRequests)
         {
-            var retry = GetRetryText(response);
+            var retryAfter = GetRetryAfter(response) ?? DefaultRateLimitDelay;
             throw new AppUpdateException(
-                $"GitHub ograniczył żądanie HTTP {status}.{retry}",
-                "GitHub chwilowo ograniczył sprawdzanie aktualizacji. Spróbuj ponownie później.");
+                $"GitHub ograniczył żądanie HTTP {status}. Ponowienie najwcześniej za {retryAfter}.",
+                "GitHub chwilowo ograniczył sprawdzanie aktualizacji. Aplikacja poczeka do wskazanego terminu.",
+                retryAfter);
         }
         if (response.StatusCode == HttpStatusCode.NotFound)
             throw new AppUpdateException(
                 "GitHub nie znalazł publicznego wydania lub pliku aktualizacji (HTTP 404).",
                 "Nie znaleziono kompletnego publicznego wydania aplikacji na GitHubie.");
+        var serverRetryAfter = GetRetryAfter(response);
+        if (status >= 500 && serverRetryAfter is { } serviceRetryAfter && serviceRetryAfter > TimeSpan.Zero)
+            throw new AppUpdateException(
+                $"GitHub zwrócił HTTP {status} i poprosił o przerwę {serviceRetryAfter}.",
+                "GitHub jest chwilowo niedostępny. Aplikacja poczeka do wskazanego terminu.",
+                serviceRetryAfter);
         throw new AppUpdateException(
             $"Nie udało się {operation}: HTTP {status} {response.ReasonPhrase}.",
             "Nie udało się połączyć z usługą aktualizacji GitHub. Spróbuj ponownie później.");
     }
 
-    private static string GetRetryText(HttpResponseMessage response)
+    private static TimeSpan? GetRetryAfter(HttpResponseMessage response)
     {
-        if (response.Headers.RetryAfter?.Delta is { } delta) return $" Retry-After: {delta}.";
-        if (response.Headers.RetryAfter?.Date is { } date) return $" Retry-After: {date:O}.";
+        TimeSpan? delay = response.Headers.RetryAfter?.Delta;
+        if (delay is null && response.Headers.RetryAfter?.Date is { } date)
+            delay = date - DateTimeOffset.UtcNow;
         if (response.Headers.TryGetValues("X-RateLimit-Reset", out var values))
-            return $" X-RateLimit-Reset: {string.Join(",", values)}.";
-        return string.Empty;
+        {
+            var resetValue = values.FirstOrDefault();
+            if (long.TryParse(resetValue, NumberStyles.None, CultureInfo.InvariantCulture, out var unixSeconds))
+            {
+                try
+                {
+                    var resetDelay = DateTimeOffset.FromUnixTimeSeconds(unixSeconds) - DateTimeOffset.UtcNow;
+                    if (delay is null || resetDelay > delay) delay = resetDelay;
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    // Niepoprawny nagłówek nie może zablokować aktualizatora na zawsze.
+                }
+            }
+        }
+
+        if (delay is null) return null;
+        if (delay <= TimeSpan.Zero) return TimeSpan.Zero;
+        return delay > MaximumRateLimitDelay ? MaximumRateLimitDelay : delay;
     }
 
     private static bool IsRedirect(HttpStatusCode statusCode) => (int)statusCode is 301 or 302 or 303 or 307 or 308;

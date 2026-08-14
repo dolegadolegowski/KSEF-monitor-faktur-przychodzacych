@@ -14,7 +14,8 @@ namespace KsefMonitor;
 internal sealed class MyDrApiClient : IDisposable
 {
     private const int PageSize = 100;
-    private const int MaximumPages = 1_000;
+    private const int MaximumPages = 100;
+    private static readonly TimeSpan DefaultMinimumRequestInterval = TimeSpan.FromMilliseconds(500);
     private static readonly Uri ProductionBaseUri = new("https://edm.mydr.pl/secure/ext_api/");
     private static readonly HashSet<string> SafeOAuthErrorCodes = new(StringComparer.Ordinal)
     {
@@ -37,7 +38,10 @@ internal sealed class MyDrApiClient : IDisposable
     private readonly HttpClient _http;
     private readonly Action<string>? _rotatedRefreshTokenHandler;
     private readonly SemaphoreSlim _authGate = new(1, 1);
+    private readonly SemaphoreSlim _requestPacingGate = new(1, 1);
     private readonly object _tokenStateLock = new();
+    private readonly TimeSpan _minimumRequestInterval;
+    private DateTimeOffset _nextApiRequestUtc;
     private string _clientId;
     private string _clientSecret;
     private string _refreshToken;
@@ -49,7 +53,8 @@ internal sealed class MyDrApiClient : IDisposable
     public MyDrApiClient(
         MyDrCredentials credentials,
         HttpMessageHandler? handler = null,
-        Action<string>? rotatedRefreshTokenHandler = null)
+        Action<string>? rotatedRefreshTokenHandler = null,
+        TimeSpan? minimumRequestInterval = null)
     {
         ArgumentNullException.ThrowIfNull(credentials);
         credentials.NormalizeAfterLoad();
@@ -58,6 +63,9 @@ internal sealed class MyDrApiClient : IDisposable
         _clientSecret = credentials.ClientSecret;
         _refreshToken = credentials.RefreshToken;
         _rotatedRefreshTokenHandler = rotatedRefreshTokenHandler;
+        _minimumRequestInterval = minimumRequestInterval ?? DefaultMinimumRequestInterval;
+        if (_minimumRequestInterval < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(minimumRequestInterval));
 
         var effectiveHandler = handler ?? CreateDefaultHandler();
         _http = new HttpClient(effectiveHandler, disposeHandler: handler is null)
@@ -153,7 +161,7 @@ internal sealed class MyDrApiClient : IDisposable
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
-        if (visitId <= 0) throw new ArgumentOutOfRangeException(nameof(visitId));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(visitId);
 
         using var response = await SendAuthorizedGetAsync(
             $"visits/{visitId.ToString(CultureInfo.InvariantCulture)}/services/",
@@ -327,6 +335,7 @@ internal sealed class MyDrApiClient : IDisposable
     {
         try
         {
+            if (!isOAuthRequest) await WaitForApiRequestSlotAsync(cancellationToken).ConfigureAwait(false);
             var response = await _http.SendAsync(
                 request,
                 HttpCompletionOption.ResponseHeadersRead,
@@ -346,6 +355,23 @@ internal sealed class MyDrApiClient : IDisposable
         catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException)
         {
             throw new MyDrApiException("Nie udało się połączyć z MyDR. Sprawdź połączenie z internetem.");
+        }
+    }
+
+    private async Task WaitForApiRequestSlotAsync(CancellationToken cancellationToken)
+    {
+        if (_minimumRequestInterval <= TimeSpan.Zero) return;
+
+        await _requestPacingGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var delay = _nextApiRequestUtc - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero) await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            _nextApiRequestUtc = DateTimeOffset.UtcNow + _minimumRequestInterval;
+        }
+        finally
+        {
+            _requestPacingGate.Release();
         }
     }
 
@@ -499,6 +525,7 @@ internal sealed class MyDrApiClient : IDisposable
             _accessTokenValidUntilUtc = default;
         }
         _authGate.Dispose();
+        _requestPacingGate.Dispose();
         _http.Dispose();
     }
 }

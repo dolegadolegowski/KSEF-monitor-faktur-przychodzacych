@@ -22,6 +22,7 @@ internal static class AppPaths
     public static string StateFile => Path.Combine(Root, "invoices.dat");
     public static string TokenFile => Path.Combine(Root, "credential.dat");
     public static string DownloadRateFile => Path.Combine(Root, "download-rate.dat");
+    public static string MetadataRateFile => Path.Combine(Root, "metadata-rate.dat");
     public static string MyDrCredentialsFile => Path.Combine(Root, "mydr-credentials.dat");
     public static string MyDrStateFile => Path.Combine(Root, "mydr-state.dat");
     public static string LogFile => Path.Combine(Root, "app.log");
@@ -232,6 +233,43 @@ internal sealed class AppStore
         }
     }
 
+    public List<DateTimeOffset>? LoadMetadataAttempts()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                if (!FileOrBackupExists(AppPaths.MetadataRateFile)) return null;
+                return ReadProtectedWithBackup(
+                           AppPaths.MetadataRateFile,
+                           "licznika zapytań o metadane",
+                           clear => JsonSerializer.Deserialize<List<DateTimeOffset>>(clear, JsonOptions))
+                       ?? new List<DateTimeOffset>();
+            }
+            catch (Exception exception)
+            {
+                RecordLoadWarning("Nie udało się odczytać licznika zapytań o metadane.", exception);
+                return new List<DateTimeOffset>();
+            }
+        }
+    }
+
+    public void SaveMetadataAttempts(IReadOnlyList<DateTimeOffset> attempts)
+    {
+        lock (_gate)
+        {
+            var clear = JsonSerializer.SerializeToUtf8Bytes(attempts, JsonOptions);
+            try
+            {
+                AtomicWrite(AppPaths.MetadataRateFile, WindowsDataProtection.Protect(clear));
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clear);
+            }
+        }
+    }
+
     public void DeleteToken()
     {
         lock (_gate)
@@ -336,19 +374,46 @@ internal sealed class AppStore
     {
         ArgumentNullException.ThrowIfNull(state);
         var snapshot = state.Snapshot();
-        lock (_gate)
+        var protectedBytes = ProtectMyDrStateSnapshot(snapshot);
+        try
         {
-            var clear = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
-            try
-            {
-                AtomicWrite(
-                    AppPaths.MyDrStateFile,
-                    WindowsDataProtection.Protect(clear, MyDrStateProtectionPurpose));
-            }
-            finally
-            {
-                CryptographicOperations.ZeroMemory(clear);
-            }
+            lock (_gate) AtomicWrite(AppPaths.MyDrStateFile, protectedBytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(protectedBytes);
+        }
+    }
+
+    // Zmiana konta musi usunąć również kopię zapasową poprzedniego konta.
+    // Zwykły AtomicWrite zachowałby ją jako .bak mimo wyczyszczenia stanu głównego.
+    public void ReplaceMyDrState(MyDrState state)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        var snapshot = state.Snapshot();
+        // Przygotowanie kompletnego zaszyfrowanego zapisu następuje zanim
+        // dotkniemy plików poprzedniego konta.
+        var protectedBytes = ProtectMyDrStateSnapshot(snapshot);
+        try
+        {
+            lock (_gate) AtomicReplaceWithoutBackup(AppPaths.MyDrStateFile, protectedBytes);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(protectedBytes);
+        }
+    }
+
+    private static byte[] ProtectMyDrStateSnapshot(MyDrState snapshot)
+    {
+        var clear = JsonSerializer.SerializeToUtf8Bytes(snapshot, JsonOptions);
+        try
+        {
+            return WindowsDataProtection.Protect(clear, MyDrStateProtectionPurpose);
+        }
+        finally
+        {
+            CryptographicOperations.ZeroMemory(clear);
         }
     }
 
@@ -372,6 +437,31 @@ internal sealed class AppStore
 
             if (File.Exists(path))
                 File.Replace(temp, path, path + ".bak", ignoreMetadataErrors: true);
+            else
+                File.Move(temp, path);
+        }
+        finally
+        {
+            if (File.Exists(temp)) File.Delete(temp);
+        }
+    }
+
+    internal static void AtomicReplaceWithoutBackup(string path, byte[] bytes)
+    {
+        var temp = path + ".tmp";
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(bytes);
+                stream.Flush(flushToDisk: true);
+            }
+
+            // Najpierw usuwamy backup poprzedniego konta. Jeśli to się nie uda,
+            // stary plik główny pozostaje nietknięty i nowy stan nie jest udawany.
+            if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+            if (File.Exists(path))
+                File.Replace(temp, path, destinationBackupFileName: null, ignoreMetadataErrors: true);
             else
                 File.Move(temp, path);
         }

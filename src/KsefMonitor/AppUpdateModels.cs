@@ -89,13 +89,26 @@ internal sealed record AppUpdateSnapshot(
 
 internal sealed class AppUpdateException : Exception
 {
-    public AppUpdateException(string technicalMessage, string userMessage)
-        : base(technicalMessage) => UserMessage = userMessage;
+    public AppUpdateException(string technicalMessage, string userMessage, TimeSpan? retryAfter = null)
+        : base(technicalMessage)
+    {
+        UserMessage = userMessage;
+        RetryAfter = retryAfter;
+    }
 
-    public AppUpdateException(string technicalMessage, string userMessage, Exception innerException)
-        : base(technicalMessage, innerException) => UserMessage = userMessage;
+    public AppUpdateException(
+        string technicalMessage,
+        string userMessage,
+        Exception innerException,
+        TimeSpan? retryAfter = null)
+        : base(technicalMessage, innerException)
+    {
+        UserMessage = userMessage;
+        RetryAfter = retryAfter;
+    }
 
     public string UserMessage { get; }
+    public TimeSpan? RetryAfter { get; }
 }
 
 internal static class GitHubReleasePolicy

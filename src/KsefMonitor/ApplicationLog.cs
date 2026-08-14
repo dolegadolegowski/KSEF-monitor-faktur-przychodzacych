@@ -19,7 +19,7 @@ internal sealed class ApplicationLog
     public ApplicationLog(string filePath, long maximumFileBytes = DefaultMaximumFileBytes)
     {
         if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("Ścieżka dziennika nie może być pusta.", nameof(filePath));
-        if (maximumFileBytes < 256) throw new ArgumentOutOfRangeException(nameof(maximumFileBytes));
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumFileBytes, 256);
         _filePath = filePath;
         _previousFilePath = Path.Combine(
             Path.GetDirectoryName(filePath) ?? string.Empty,
@@ -35,7 +35,7 @@ internal sealed class ApplicationLog
 
     public string ReadRecent(int maximumCharacters = 250_000)
     {
-        if (maximumCharacters < 1) throw new ArgumentOutOfRangeException(nameof(maximumCharacters));
+        ArgumentOutOfRangeException.ThrowIfLessThan(maximumCharacters, 1);
         lock (_gate)
         {
             try

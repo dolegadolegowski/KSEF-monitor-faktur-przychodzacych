@@ -6,10 +6,12 @@ using System.Globalization;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
+using AutomationProperties = System.Windows.Automation.AutomationProperties;
 using Forms = System.Windows.Forms;
 
 namespace KsefMonitor;
@@ -36,9 +38,12 @@ internal sealed class MainWindow : Window
     private readonly Forms.ContextMenuStrip _trayMenu;
     private readonly Forms.NotifyIcon _notifyIcon;
     private readonly DispatcherTimer _clock = new() { Interval = TimeSpan.FromSeconds(1) };
+    private readonly DispatcherTimer _myDrPopupCloseTimer = new() { Interval = TimeSpan.FromMilliseconds(220) };
     private readonly StatusBannerState _statusBanner = new(TimeSpan.FromSeconds(30));
     private readonly Dictionary<string, InvoiceDetailsWindow> _detailsWindows = new(StringComparer.Ordinal);
     private DateTime _displayMonth = GetCurrentWarsawMonth();
+    private Popup? _myDrDoctorTurnoverPopup;
+    private FrameworkElement? _myDrDoctorTurnoverSource;
     private bool _reallyClose;
     private bool _minimizeHintShown;
     private string? _notificationTarget;
@@ -80,6 +85,11 @@ internal sealed class MainWindow : Window
         {
             UpdateSyncLabels();
             ExpireStatusIfNeeded();
+        };
+        _myDrPopupCloseTimer.Tick += (_, _) =>
+        {
+            _myDrPopupCloseTimer.Stop();
+            if (!IsMyDrDoctorTurnoverPopupActive()) HideMyDrDoctorTurnoverPopup();
         };
         _clock.Start();
         RefreshRows();
@@ -405,7 +415,7 @@ internal sealed class MainWindow : Window
     private void OpenSettings()
     {
         ShowFromTray();
-        var window = new SettingsWindow(_store, _myDrSynchronization, _updates) { Owner = this };
+        var window = new SettingsWindow(_store, _synchronization, _myDrSynchronization, _updates) { Owner = this };
         window.ShowDialog();
         if (window.ConfigurationChanged)
         {
@@ -628,9 +638,11 @@ internal sealed class MainWindow : Window
 
     private void RefreshMyDrSummary()
     {
+        CloseMyDrDoctorTurnoverPopup();
         var status = _myDrSynchronization.GetStatusSnapshot();
         var summary = _myDrSynchronization.GetMonthSummary(_displayMonth.Year, _displayMonth.Month);
         _myDrMonthSummary.Inlines.Clear();
+        _myDrMonthSummary.ToolTip = null;
         _myDrMonthSummary.Inlines.Add(new Run("Obrót MyDR: ")
         {
             FontSize = 12.5,
@@ -666,11 +678,35 @@ internal sealed class MainWindow : Window
             return;
         }
 
-        _myDrMonthSummary.Inlines.Add(new Run($"{summary.GrossAmount:N2} PLN")
+        var amountText = new TextBlock
         {
+            Text = $"{summary.GrossAmount:N2} PLN",
             FontSize = _monthLabel.FontSize,
             FontWeight = FontWeights.SemiBold,
-            Foreground = new SolidColorBrush(Color.FromRgb(43, 55, 70))
+            Foreground = new SolidColorBrush(Color.FromRgb(43, 55, 70)),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var amountTarget = new Button
+        {
+            Content = amountText,
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0),
+            Margin = new Thickness(0),
+            Cursor = Cursors.Help,
+            Focusable = true,
+            IsTabStop = true,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center
+        };
+        AutomationProperties.SetName(amountTarget,
+            $"Obrót MyDR {summary.GrossAmount:N2} PLN. Pokaż podział według lekarza lub personelu.");
+        AutomationProperties.SetHelpText(amountTarget,
+            "Najedź myszą albo ustaw fokus klawiaturą, aby zobaczyć miesięczny obrót poszczególnych osób.");
+        ConfigureMyDrDoctorTurnoverPopup(amountTarget, summary, status);
+        _myDrMonthSummary.Inlines.Add(new InlineUIContainer(amountTarget)
+        {
+            BaselineAlignment = BaselineAlignment.Center
         });
         _myDrMonthSummary.Inlines.Add(new Run($"  •  wizyty: {summary.VisitCount}  •  usługi: {summary.ServiceCount}")
         {
@@ -683,13 +719,254 @@ internal sealed class MainWindow : Window
                 Foreground = Brushes.Firebrick
             });
 
+    }
+
+    private static Border BuildMyDrDoctorTurnoverPopupContent(
+        MyDrMonthSummary summary,
+        MyDrSyncStatus status)
+    {
+        var culture = CultureInfo.GetCultureInfo("pl-PL");
+        var monthName = new DateTime(summary.Year, summary.Month, 1)
+            .ToString("MMMM yyyy", culture);
+        var content = new StackPanel();
+        content.Children.Add(new TextBlock
+        {
+            Text = $"Obrót według lekarza/personelu — {monthName}",
+            FontSize = 13,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromRgb(31, 45, 61)),
+            Margin = new Thickness(0, 0, 0, 9)
+        });
+
+        var visibleDoctors = MyDrDoctorTurnoverPresentation.GetVisibleRows(summary);
+
+        if (!summary.DoctorBreakdownAvailable)
+        {
+            content.Children.Add(CreateMyDrTooltipMessage(
+                "Podział według lekarzy pojawi się po najbliższym poprawnym odświeżeniu MyDR."));
+        }
+        else if (visibleDoctors.Count == 0)
+        {
+            content.Children.Add(CreateMyDrTooltipMessage(
+                "Brak lekarzy z obrotem różnym od 0,00 PLN w tym miesiącu."));
+        }
+        else
+        {
+            var table = new Grid();
+            table.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            table.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            table.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            AddMyDrTooltipCell(table, new TextBlock
+            {
+                Text = "Lekarz / personel",
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromRgb(91, 102, 116)),
+                Margin = new Thickness(0, 0, 14, 5)
+            }, 0, 0);
+            AddMyDrTooltipCell(table, new TextBlock
+            {
+                Text = "Obrót",
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromRgb(91, 102, 116)),
+                TextAlignment = TextAlignment.Right,
+                Margin = new Thickness(8, 0, 0, 5)
+            }, 0, 1);
+
+            for (var index = 0; index < visibleDoctors.Count; index++)
+            {
+                var doctor = visibleDoctors[index];
+                var row = index + 1;
+                table.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                AddMyDrTooltipCell(table, new TextBlock
+                {
+                    Text = doctor.DisplayName,
+                    FontSize = 12.5,
+                    Foreground = new SolidColorBrush(Color.FromRgb(31, 45, 61)),
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 245,
+                    Margin = new Thickness(0, 3, 14, 3)
+                }, row, 0);
+                AddMyDrTooltipCell(table, new TextBlock
+                {
+                    Text = $"{doctor.GrossAmount:N2} PLN",
+                    FontSize = 12.5,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = new SolidColorBrush(Color.FromRgb(31, 45, 61)),
+                    TextAlignment = TextAlignment.Right,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(8, 3, 0, 3)
+                }, row, 1);
+            }
+
+            content.Children.Add(new ScrollViewer
+            {
+                Content = table,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                MaxHeight = 300
+            });
+        }
+
         var lastSuccess = status.LastSuccessfulSyncUtc is { } success
             ? TimeZoneInfo.ConvertTime(success, MyDrDailySchedule.WarsawTimeZone)
-                .ToString("dd.MM.yyyy HH:mm", CultureInfo.GetCultureInfo("pl-PL"))
+                .ToString("dd.MM.yyyy HH:mm", culture)
             : "brak";
-        _myDrMonthSummary.ToolTip =
-            $"Ostatnie poprawne odświeżenie: {lastSuccess}.\n" +
-            "Suma pola value usług prywatnych dla wykonanych wizyt: Do rozliczenia, Oczekuje na płatność, Zakończona, Zamknięta lub Archiwalna. Dane są sprawdzane raz dziennie.";
+        var footer = new StackPanel { Margin = new Thickness(0, 9, 0, 0) };
+        footer.Children.Add(new TextBlock
+        {
+            Text = $"Ostatnie poprawne odświeżenie: {lastSuccess}",
+            FontSize = 10.5,
+            Foreground = new SolidColorBrush(Color.FromRgb(91, 102, 116))
+        });
+        if (!string.IsNullOrWhiteSpace(status.LastError))
+        {
+            footer.Children.Add(new TextBlock
+            {
+                Text = "Ostatnia próba nie powiodła się — pokazano ostatnie poprawne dane.",
+                FontSize = 10.5,
+                Foreground = Brushes.Firebrick,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 3, 0, 0)
+            });
+        }
+        content.Children.Add(footer);
+
+        return new Border
+        {
+            MaxWidth = 420,
+            Background = Brushes.White,
+            BorderBrush = new SolidColorBrush(Color.FromRgb(205, 212, 222)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Padding = new Thickness(12),
+            Child = content,
+            Effect = new System.Windows.Media.Effects.DropShadowEffect
+            {
+                BlurRadius = 12,
+                ShadowDepth = 2,
+                Opacity = 0.22
+            }
+        };
+    }
+
+    private void ConfigureMyDrDoctorTurnoverPopup(
+        Button source,
+        MyDrMonthSummary summary,
+        MyDrSyncStatus status)
+    {
+        var content = BuildMyDrDoctorTurnoverPopupContent(summary, status);
+        var scrollViewer = FindVisualDescendant<ScrollViewer>(content);
+        if (scrollViewer is not null)
+        {
+            scrollViewer.Focusable = true;
+            scrollViewer.IsTabStop = true;
+        }
+        var popup = new Popup
+        {
+            PlacementTarget = source,
+            Placement = PlacementMode.Bottom,
+            VerticalOffset = 4,
+            AllowsTransparency = true,
+            StaysOpen = false,
+            PopupAnimation = PopupAnimation.Fade,
+            Child = content
+        };
+        _myDrDoctorTurnoverSource = source;
+        _myDrDoctorTurnoverPopup = popup;
+
+        source.MouseEnter += (_, _) => OpenMyDrDoctorTurnoverPopup();
+        source.MouseLeave += (_, _) => ScheduleMyDrDoctorTurnoverPopupClose();
+        source.GotKeyboardFocus += (_, _) => OpenMyDrDoctorTurnoverPopup();
+        source.LostKeyboardFocus += (_, _) => ScheduleMyDrDoctorTurnoverPopupClose();
+        source.Click += (_, _) => OpenMyDrDoctorTurnoverPopup();
+        source.PreviewKeyDown += (_, eventArgs) =>
+        {
+            if (eventArgs.Key == Key.Escape)
+            {
+                HideMyDrDoctorTurnoverPopup();
+                eventArgs.Handled = true;
+                return;
+            }
+
+            if (eventArgs.Key is not (Key.Enter or Key.Space or Key.Down) || scrollViewer is null) return;
+            OpenMyDrDoctorTurnoverPopup();
+            Dispatcher.BeginInvoke(DispatcherPriority.Input, () => scrollViewer.Focus());
+            eventArgs.Handled = true;
+        };
+        content.MouseEnter += (_, _) => _myDrPopupCloseTimer.Stop();
+        content.MouseLeave += (_, _) => ScheduleMyDrDoctorTurnoverPopupClose();
+        content.PreviewKeyDown += (_, eventArgs) =>
+        {
+            if (eventArgs.Key != Key.Escape) return;
+            source.Focus();
+            HideMyDrDoctorTurnoverPopup();
+            eventArgs.Handled = true;
+        };
+    }
+
+    private void OpenMyDrDoctorTurnoverPopup()
+    {
+        _myDrPopupCloseTimer.Stop();
+        if (_myDrDoctorTurnoverPopup is not null) _myDrDoctorTurnoverPopup.IsOpen = true;
+    }
+
+    private void ScheduleMyDrDoctorTurnoverPopupClose()
+    {
+        _myDrPopupCloseTimer.Stop();
+        _myDrPopupCloseTimer.Start();
+    }
+
+    private bool IsMyDrDoctorTurnoverPopupActive() =>
+        _myDrDoctorTurnoverSource is { IsMouseOver: true } or { IsKeyboardFocusWithin: true } ||
+        _myDrDoctorTurnoverPopup?.Child is FrameworkElement { IsMouseOver: true } or { IsKeyboardFocusWithin: true };
+
+    private void HideMyDrDoctorTurnoverPopup()
+    {
+        _myDrPopupCloseTimer.Stop();
+        if (_myDrDoctorTurnoverPopup is not null) _myDrDoctorTurnoverPopup.IsOpen = false;
+    }
+
+    private void CloseMyDrDoctorTurnoverPopup()
+    {
+        _myDrPopupCloseTimer.Stop();
+        if (_myDrDoctorTurnoverPopup is not null)
+        {
+            _myDrDoctorTurnoverPopup.IsOpen = false;
+            _myDrDoctorTurnoverPopup.Child = null;
+            _myDrDoctorTurnoverPopup.PlacementTarget = null;
+        }
+        _myDrDoctorTurnoverPopup = null;
+        _myDrDoctorTurnoverSource = null;
+    }
+
+    private static TextBlock CreateMyDrTooltipMessage(string text) => new()
+    {
+        Text = text,
+        FontSize = 12,
+        Foreground = new SolidColorBrush(Color.FromRgb(70, 81, 94)),
+        TextWrapping = TextWrapping.Wrap,
+        MaxWidth = 350
+    };
+
+    private static void AddMyDrTooltipCell(Grid grid, UIElement element, int row, int column)
+    {
+        Grid.SetRow(element, row);
+        Grid.SetColumn(element, column);
+        grid.Children.Add(element);
+    }
+
+    private static T? FindVisualDescendant<T>(DependencyObject parent) where T : DependencyObject
+    {
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, index);
+            if (child is T match) return match;
+            var nested = FindVisualDescendant<T>(child);
+            if (nested is not null) return nested;
+        }
+        return null;
     }
 
     private static void ConfigureSummaryText(TextBlock text)
@@ -736,6 +1013,7 @@ internal sealed class MainWindow : Window
     private void OnWindowStateChanged(object? sender, EventArgs e)
     {
         if (WindowState != WindowState.Minimized) return;
+        HideMyDrDoctorTurnoverPopup();
         Hide();
         if (!_minimizeHintShown)
         {
@@ -748,6 +1026,7 @@ internal sealed class MainWindow : Window
     {
         if (_reallyClose) return;
         e.Cancel = true;
+        HideMyDrDoctorTurnoverPopup();
         Hide();
     }
 
@@ -766,6 +1045,8 @@ internal sealed class MainWindow : Window
         if (_reallyClose) return;
         _reallyClose = true;
         _clock.Stop();
+        CloseMyDrDoctorTurnoverPopup();
+        _myDrPopupCloseTimer.Stop();
         _synchronization.StatusChanged -= OnStatusChanged;
         _synchronization.StateChanged -= OnStateChanged;
         _synchronization.NewInvoicesDiscovered -= OnNewInvoicesDiscovered;
