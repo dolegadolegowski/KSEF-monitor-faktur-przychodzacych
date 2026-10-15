@@ -2,7 +2,7 @@
 
 Desktopowa aplikacja Windows 11 do monitorowania faktur otrzymanych w Krajowym Systemie e-Faktur (KSeF API 2.0) oraz miesięcznego obrotu usług prywatnych z MyDR.
 
-Aktualny etap: działająca wersja `0.7.0`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
+Aktualny etap: działająca wersja `0.7.1`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
 
 ## Zaimplementowane
 
@@ -166,7 +166,7 @@ Plików `.dat` nie da się odszyfrować na innym koncie Windows. Usunięcie fold
 - odpowiedzi Problem Details pokazują właściwy kod i szczegóły KSeF zamiast samego ogólnego opisu;
 - HTTP 429 nie jest maskowany — komunikat zawiera `Retry-After` zwrócone przez KSeF.
 
-Przy wolumenie wymagającym ponad 18 stron metadanych w jednej godzinie aplikacja zatrzyma paginację przed limitem serwera i wyświetli błąd zamiast przeciążać API. Dla podmiotów o bardzo dużym wolumenie docelowym mechanizmem KSeF jest asynchroniczny eksport faktur; bieżąca wersja monitora jest zoptymalizowana pod zwykły wolumen kliniki.
+Przy wolumenie wymagającym ponad 18 stron metadanych w jednej godzinie aplikacja zapisuje każdą odebraną stronę i kursor kontynuacji, zatrzymuje się przed limitem, a po przerwie lub restarcie wznawia od kolejnej strony. HWM i miesięczna lista są zatwierdzane dopiero po odebraniu kompletnego zakresu. Dla bardzo dużego wolumenu docelowym mechanizmem pozostaje asynchroniczny eksport KSeF.
 
 ## Zachowanie synchronizacji MyDR
 

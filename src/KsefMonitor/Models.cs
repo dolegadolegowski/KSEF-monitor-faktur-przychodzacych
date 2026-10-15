@@ -28,6 +28,7 @@ internal sealed class AppState
     public DateTimeOffset? LastSuccessfulSyncUtc { get; set; }
     public DateTimeOffset? LastMetadataSyncAttemptUtc { get; set; }
     public DateTimeOffset? PermanentStorageHwmDate { get; set; }
+    public MetadataQueryCheckpoint? MetadataCheckpoint { get; set; }
     public DateTimeOffset? ApiBlockedUntilUtc { get; set; }
     public DateTimeOffset? InvoiceDownloadBlockedUntilUtc { get; set; }
     public DateTimeOffset? LastInvoiceDownloadAttemptUtc { get; set; }
@@ -51,6 +52,7 @@ internal sealed class AppState
         LastSuccessfulSyncUtc = null;
         LastMetadataSyncAttemptUtc = null;
         PermanentStorageHwmDate = null;
+        MetadataCheckpoint = null;
         InvoiceDownloadBlockedUntilUtc = null;
         HistoricalBackfillBeforeIssueDate = null;
         Invoices.Clear();
@@ -68,6 +70,7 @@ internal sealed class AppState
         LastSuccessfulSyncUtc = LastSuccessfulSyncUtc,
         LastMetadataSyncAttemptUtc = LastMetadataSyncAttemptUtc,
         PermanentStorageHwmDate = PermanentStorageHwmDate,
+        MetadataCheckpoint = MetadataCheckpoint?.Snapshot(),
         ApiBlockedUntilUtc = ApiBlockedUntilUtc,
         InvoiceDownloadBlockedUntilUtc = InvoiceDownloadBlockedUntilUtc,
         LastInvoiceDownloadAttemptUtc = LastInvoiceDownloadAttemptUtc,
@@ -83,6 +86,9 @@ internal sealed class AppState
         ContextNip ??= string.Empty;
         InvoiceDownloadAttemptsUtc ??= new List<DateTimeOffset>();
         Invoices ??= new Dictionary<string, StoredInvoice>(StringComparer.Ordinal);
+        if (MetadataCheckpoint is { } checkpoint &&
+            (checkpoint.Invoices is null || checkpoint.From == default || checkpoint.PageOffset < 0))
+            MetadataCheckpoint = null;
 
         var normalized = new Dictionary<string, StoredInvoice>(StringComparer.Ordinal);
         foreach (var pair in Invoices)
@@ -93,6 +99,25 @@ internal sealed class AppState
         }
         Invoices = normalized;
     }
+}
+
+internal sealed class MetadataQueryCheckpoint
+{
+    public DateTimeOffset From { get; set; }
+    public DateTimeOffset WindowFrom { get; set; }
+    public DateTimeOffset? WindowTo { get; set; }
+    public DateTimeOffset RangeFrom { get; set; }
+    public int PageOffset { get; set; }
+    public bool Complete { get; set; }
+    public DateTimeOffset? Hwm { get; set; }
+    public Dictionary<string, InvoiceMetadata> Invoices { get; set; } = new(StringComparer.Ordinal);
+
+    public MetadataQueryCheckpoint Snapshot() => new()
+    {
+        From = From, WindowFrom = WindowFrom, WindowTo = WindowTo, RangeFrom = RangeFrom,
+        PageOffset = PageOffset, Complete = Complete, Hwm = Hwm,
+        Invoices = new Dictionary<string, InvoiceMetadata>(Invoices, StringComparer.Ordinal)
+    };
 }
 
 internal sealed class StoredInvoice

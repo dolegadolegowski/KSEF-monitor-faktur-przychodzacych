@@ -44,6 +44,9 @@ jobs:
       - name: Uruchom testy
         run: dotnet run --project .\tests\KsefMonitor.SmokeTests\KsefMonitor.SmokeTests.csproj -c Release
 
+      - name: Sprawdź rzeczywisty układ WPF na Windows
+        run: dotnet run --project .\tests\KsefMonitor.UiTests\KsefMonitor.UiTests.csproj -c Release
+
       - name: Zbuduj pliki integracyjnego testu aktualizatora
         shell: pwsh
         run: |

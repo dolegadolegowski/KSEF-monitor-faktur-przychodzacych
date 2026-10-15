@@ -260,7 +260,8 @@ internal sealed class SynchronizationService : IDisposable
                     _client = new KsefApiClient(
                         _settings,
                         _token,
-                        metadataRequestReservation: ReserveMetadataRequestAsync);
+                        metadataRequestReservation: ReserveMetadataRequestAsync,
+                        invoiceRequestReservation: ReservePhysicalInvoiceRequestAsync);
                     _clientConfigurationVersion = configurationVersionAtStart;
                 }
                 client = _client;
@@ -484,7 +485,8 @@ internal sealed class SynchronizationService : IDisposable
                     _client = new KsefApiClient(
                         _settings,
                         _token,
-                        metadataRequestReservation: ReserveMetadataRequestAsync);
+                        metadataRequestReservation: ReserveMetadataRequestAsync,
+                        invoiceRequestReservation: ReservePhysicalInvoiceRequestAsync);
                     _clientConfigurationVersion = configurationVersionAtStart;
                 }
                 client = _client;
@@ -519,25 +521,36 @@ internal sealed class SynchronizationService : IDisposable
             {
                 var savedHwm = State.PermanentStorageHwmDate;
                 var initialFrom = GetInitialFromDate();
-                var from = savedHwm is { } hwm && hwm > initialFrom ? hwm : initialFrom;
+                var from = State.MetadataCheckpoint?.From ??
+                    (savedHwm is { } hwm && hwm > initialFrom ? hwm : initialFrom);
                 State.LastMetadataSyncAttemptUtc = DateTimeOffset.UtcNow;
                 _store.SaveState(State);
-                return (From: from, UsesSavedHwm: savedHwm is not null && from == savedHwm);
+                return (From: from, UsesSavedHwm: savedHwm is not null && from == savedHwm,
+                    Checkpoint: State.MetadataCheckpoint?.Snapshot());
+            }, syncToken);
+            Task SaveCheckpoint(MetadataQueryCheckpoint checkpoint) => WithCurrentConfiguration(configurationVersionAtStart, () =>
+            {
+                State.MetadataCheckpoint = checkpoint;
+                SetStatus($"Pobieranie listy faktur: odebrano {checkpoint.Invoices.Count} dokumentów…");
+                return _store.SaveStateAsync(State);
             }, syncToken);
             MetadataQueryResult result;
             var recoveredHwm = false;
             try
             {
-                result = await client.QueryReceivedInvoicesAsync(queryPlan.From, syncToken).ConfigureAwait(false);
+                result = await client.QueryReceivedInvoicesAsync(queryPlan.From, syncToken,
+                    queryPlan.Checkpoint, SaveCheckpoint).ConfigureAwait(false);
             }
-            catch (KsefApiException exception) when (queryPlan.UsesSavedHwm && exception.HasErrorCode(21183))
+            catch (KsefApiException exception) when ((queryPlan.UsesSavedHwm || queryPlan.Checkpoint is not null) && exception.HasErrorCode(21183))
             {
                 // Rzadko serwer może uznać zapisany wcześniej HWM za późniejszy od
                 // aktualnego punktu. Odbudowanie widocznego zakresu jest bezpieczne,
                 // bo faktury są deduplikowane po numerze KSeF.
                 SetStatus("Odtwarzanie punktu synchronizacji KSeF…");
                 _log.Warning("Synchronizacja", "Zapisany punkt HWM został odrzucony. Odtwarzanie widocznego zakresu.", exception);
-                result = await client.QueryReceivedInvoicesAsync(GetInitialFromDate(), syncToken).ConfigureAwait(false);
+                WithCurrentConfiguration(configurationVersionAtStart, () => { State.MetadataCheckpoint = null; }, syncToken);
+                result = await client.QueryReceivedInvoicesAsync(GetInitialFromDate(), syncToken,
+                    saveCheckpoint: SaveCheckpoint).ConfigureAwait(false);
                 recoveredHwm = true;
             }
             syncToken.ThrowIfCancellationRequested();
@@ -554,6 +567,7 @@ internal sealed class SynchronizationService : IDisposable
                          (State.PermanentStorageHwmDate is null || hwm > State.PermanentStorageHwmDate))
                     State.PermanentStorageHwmDate = hwm;
                 State.HistoricalBackfillBeforeIssueDate = null;
+                State.MetadataCheckpoint = null;
                 _store.SaveState(State);
                 return added.Select(invoice => invoice.Snapshot()).ToList();
             }, syncToken);
@@ -669,7 +683,7 @@ internal sealed class SynchronizationService : IDisposable
         foreach (var key in obsolete) State.Invoices.Remove(key);
     }
 
-    private DateTimeOffset? ReserveInvoiceDownloadLocked(StoredInvoice invoice)
+    private DateTimeOffset? ReserveInvoiceDownloadLocked(StoredInvoice invoice, bool reserve = false)
     {
         var now = DateTimeOffset.UtcNow;
         DateTimeOffset? retryAt = invoice.NextXmlDownloadAttemptUtc is { } invoiceRetryAt && invoiceRetryAt > now
@@ -699,10 +713,25 @@ internal sealed class SynchronizationService : IDisposable
 
         if (retryAt is not null) return retryAt;
 
+        if (!reserve) return null;
         State.InvoiceDownloadAttemptsUtc.Add(now);
         State.LastInvoiceDownloadAttemptUtc = now;
         _store.SaveDownloadAttempts(State.InvoiceDownloadAttemptsUtc);
         return null;
+    }
+
+    private async Task ReservePhysicalInvoiceRequestAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            DateTimeOffset? retryAt;
+            lock (_stateGate) retryAt = ReserveInvoiceDownloadLocked(new StoredInvoice(), reserve: true);
+            if (retryAt is null) return;
+            var delay = retryAt.Value - DateTimeOffset.UtcNow;
+            if (delay > InvoiceDownloadInterval) throw new InvoiceContentPendingException(retryAt.Value);
+            if (delay > TimeSpan.Zero) await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private DateTimeOffset? GetInvoiceDownloadPacingRetryAtLocked(DateTimeOffset now)

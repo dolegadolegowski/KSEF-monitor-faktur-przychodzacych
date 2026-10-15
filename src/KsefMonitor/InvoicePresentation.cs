@@ -23,15 +23,20 @@ internal static class InvoicePagePlanner
     private const double DescriptionCharactersPerLine = 38;
     private const double MaximumLineHeight = 600;
 
-    public static IReadOnlyList<InvoicePagePlan> Plan(IReadOnlyList<InvoiceLine> lines, double firstPageHeaderExtraHeight = 0)
+    public static IReadOnlyList<InvoicePagePlan> Plan(IReadOnlyList<InvoiceLine> lines, double firstPageHeaderExtraHeight = 0,
+        Func<InvoiceLine, double>? measureHeight = null,
+        double firstPageLineCapacity = FirstPageLineCapacity,
+        double continuationPageLineCapacity = ContinuationPageLineCapacity,
+        double summaryReserve = LastPageSummaryReserve)
     {
-        var firstPageCapacity = Math.Max(300, FirstPageLineCapacity - Math.Max(0, firstPageHeaderExtraHeight));
+        measureHeight ??= EstimateLineHeight;
+        var firstPageCapacity = Math.Max(36, firstPageLineCapacity - Math.Max(0, firstPageHeaderExtraHeight));
         var workingPages = new List<List<InvoiceLine>>();
         var usedHeights = new List<double>();
 
         foreach (var line in lines)
         {
-            var lineHeight = EstimateLineHeight(line);
+            var lineHeight = measureHeight(line);
             if (workingPages.Count == 0)
             {
                 workingPages.Add(new List<InvoiceLine>());
@@ -39,7 +44,7 @@ internal static class InvoicePagePlanner
             }
 
             var pageIndex = workingPages.Count - 1;
-            var capacity = pageIndex == 0 ? firstPageCapacity : ContinuationPageLineCapacity;
+            var capacity = pageIndex == 0 ? firstPageCapacity : continuationPageLineCapacity;
             if (workingPages[pageIndex].Count > 0 && usedHeights[pageIndex] + lineHeight > capacity)
             {
                 workingPages.Add(new List<InvoiceLine>());
@@ -58,20 +63,20 @@ internal static class InvoicePagePlanner
         }
 
         var finalIndex = workingPages.Count - 1;
-        var finalNormalCapacity = finalIndex == 0 ? firstPageCapacity : ContinuationPageLineCapacity;
-        var finalCapacityWithSummary = finalNormalCapacity - LastPageSummaryReserve;
+        var finalNormalCapacity = finalIndex == 0 ? firstPageCapacity : continuationPageLineCapacity;
+        var finalCapacityWithSummary = finalNormalCapacity - summaryReserve;
         if (usedHeights[finalIndex] > finalCapacityWithSummary)
         {
             var source = workingPages[finalIndex];
             var moved = new List<InvoiceLine>();
             var movedHeight = 0d;
-            var continuationWithSummaryCapacity = ContinuationPageLineCapacity - LastPageSummaryReserve;
+            var continuationWithSummaryCapacity = continuationPageLineCapacity - summaryReserve;
             var targetHeight = Math.Min(continuationWithSummaryCapacity, usedHeights[finalIndex] / 2d);
 
             while (source.Count > 1 && movedHeight < targetHeight)
             {
                 var candidate = source[^1];
-                var candidateHeight = EstimateLineHeight(candidate);
+                var candidateHeight = measureHeight(candidate);
                 if (movedHeight + candidateHeight > continuationWithSummaryCapacity) break;
                 source.RemoveAt(source.Count - 1);
                 moved.Insert(0, candidate);

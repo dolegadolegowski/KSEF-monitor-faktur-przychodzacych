@@ -52,6 +52,8 @@ internal sealed class SettingsWindow : Window
     private CancellationTokenSource? _myDrCancellation;
     private bool _myDrStatusReadFailed;
     private bool _isClosing;
+    private string _savedKsefEdits = string.Empty;
+    private string _savedMyDrEdits = string.Empty;
 
     public SettingsWindow(
         AppStore store,
@@ -74,6 +76,8 @@ internal sealed class SettingsWindow : Window
         Content = BuildContent();
         LoadCurrentSettings();
         LoadMyDrSettings();
+        _savedKsefEdits = KsefEdits();
+        _savedMyDrEdits = MyDrEdits();
         _myDrStatusTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromSeconds(2)
@@ -82,8 +86,17 @@ internal sealed class SettingsWindow : Window
         _myDrStatusTimer.Start();
         _updates.StateChanged += OnUpdateStateChanged;
         Loaded += async (_, _) => await CheckUpdatesOnOpenAsync().ConfigureAwait(true);
-        Closing += (_, _) =>
+        Closing += (_, e) =>
         {
+            if ((KsefEdits() != _savedKsefEdits || MyDrEdits() != _savedMyDrEdits) &&
+                System.Windows.MessageBox.Show(this,
+                    "Masz niezapisane zmiany. Zamknąć ustawienia i je odrzucić?",
+                    "Niezapisane ustawienia", MessageBoxButton.YesNo, MessageBoxImage.Question,
+                    MessageBoxResult.No) != MessageBoxResult.Yes)
+            {
+                e.Cancel = true;
+                return;
+            }
             _isClosing = true;
             _testCancellation?.Cancel();
             _myDrCancellation?.Cancel();
@@ -770,6 +783,7 @@ internal sealed class SettingsWindow : Window
         _myDrClientId.Text = savedResult?.ClientId ?? clientId;
         _myDrClientSecret.Password = string.Empty;
         _myDrRefreshToken.Password = string.Empty;
+        _savedMyDrEdits = MyDrEdits();
         return true;
     }
 
@@ -862,6 +876,7 @@ internal sealed class SettingsWindow : Window
             _myDrClientId.Clear();
             _myDrClientSecret.Clear();
             _myDrRefreshToken.Clear();
+            _savedMyDrEdits = MyDrEdits();
             SetMyDrActionStatus("Dane dostępowe MyDR zostały usunięte.", isError: false);
             RefreshMyDrStatus();
         }
@@ -994,10 +1009,15 @@ internal sealed class SettingsWindow : Window
         {
             if (!string.IsNullOrWhiteSpace(_token.Password)) _store.SaveToken(_token.Password);
             _store.SaveSettings(ReadSettings());
+            _savedKsefEdits = KsefEdits();
             _store.Log.Info("Ustawienia", "Zapisano ustawienia aplikacji.");
             ConfigurationChanged = true;
+            if (MyDrEdits() != _savedMyDrEdits)
+            {
+                SetStatus("KSeF zapisano. W zakładce MyDR nadal są niezapisane zmiany.", isError: false);
+                return;
+            }
             DialogResult = true;
-            Close();
         }
         catch (Exception exception)
         {
@@ -1011,6 +1031,9 @@ internal sealed class SettingsWindow : Window
         _testButton.IsEnabled = !busy;
         _saveButton.IsEnabled = !busy;
     }
+
+    private string KsefEdits() => $"{_nip.Text}\n{_notifications.IsChecked}\n{_token.Password}";
+    private string MyDrEdits() => $"{_myDrClientId.Text}\n{_myDrClientSecret.Password}\n{_myDrRefreshToken.Password}";
 
     private void SetMyDrBusy(bool busy)
     {

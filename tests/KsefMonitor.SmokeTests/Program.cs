@@ -44,6 +44,7 @@ TestGrossLineVariant();
 TestCalculatedLineAmounts();
 TestPefUblLineVariant();
 TestA4Pagination();
+TestPaymentStatus();
 TestMonthlyInvoiceSummary();
 TestInvoiceAmountSortKey();
 TestInvoiceNewState();
@@ -250,6 +251,25 @@ static void TestA4Pagination()
         "Ekstremalnie długi opis może wyjść poza stronę A4.");
     Require(oversizedPages.SelectMany(page => page.Lines).Single() == oversized,
         "Paginacja zgubiła pozycję z bardzo długim opisem.");
+}
+
+static void TestPaymentStatus()
+{
+    InvoiceDocument Parse(string payment) => InvoiceXmlReader.Parse(
+        $"<Faktura><Fa><P_15>123.00</P_15>{payment}</Fa></Faktura>");
+    var unknown = Parse("");
+    Require(!unknown.Summary.ContainsKey("Do zapłaty"), "Brak statusu zapłaty został zastąpiony należnością.");
+    Require(Parse("<Platnosc><Zaplacono>1</Zaplacono></Platnosc>").Summary["Do zapłaty"] == "0.00",
+        "Opłacona faktura nadal pokazuje należność.");
+    Require(Parse("<Platnosc><ZnacznikZaplatyCzesciowej>2</ZnacznikZaplatyCzesciowej></Platnosc>").Summary["Do zapłaty"] == "0.00",
+        "Pełna zapłata w częściach nie została rozpoznana.");
+    var partial = Parse("<Platnosc><ZnacznikZaplatyCzesciowej>1</ZnacznikZaplatyCzesciowej>" +
+        "<ZaplataCzesciowa><KwotaZaplatyCzesciowej>23</KwotaZaplatyCzesciowej></ZaplataCzesciowa></Platnosc>");
+    Require(decimal.Parse(partial.Summary["Do zapłaty"], CultureInfo.InvariantCulture) == 100,
+        "Płatność częściowa nie pomniejsza salda dokumentu.");
+    Require(!Parse("<Platnosc><ZnacznikZaplatyCzesciowej>1</ZnacznikZaplatyCzesciowej>" +
+        "<ZaplataCzesciowa><KwotaZaplatyCzesciowej>999</KwotaZaplatyCzesciowej></ZaplataCzesciowa></Platnosc>")
+        .Summary.ContainsKey("Do zapłaty"), "Niepoprawna suma wpłat wyznaczyła fałszywe saldo.");
 }
 
 static void TestStateContextIsolation()
@@ -1158,6 +1178,11 @@ static async Task TestKsefProtocolAsync()
     var badRequestNext = false;
     var missingHwmNext = false;
     var unauthorizedMetadataResponses = 0;
+    var unauthorizedXmlResponses = 0;
+    var xmlReservations = 0;
+    var pagedMode = false;
+    string? damagedField = null;
+    var requestedPages = new List<int>();
     HttpStatusCode? refreshFailureStatus = null;
     var expectedAccessToken = "access-token";
     var refreshSequence = 0;
@@ -1220,6 +1245,25 @@ static async Task TestKsefProtocolAsync()
 
         if (path.EndsWith("/invoices/query/metadata", StringComparison.Ordinal))
         {
+            if (pagedMode || damagedField is not null)
+            {
+                var query = message.RequestUri!.Query;
+                var offsetText = query.Split('&').Single(x => x.TrimStart('?').StartsWith("pageOffset=", StringComparison.Ordinal));
+                var offset = int.Parse(offsetText.Split('=')[1], CultureInfo.InvariantCulture);
+                requestedPages.Add(offset);
+                var invoice = new Dictionary<string, object?>
+                {
+                    ["ksefNumber"] = $"resume-{offset}", ["invoiceNumber"] = $"FV/{offset}",
+                    ["issueDate"] = "2026-08-01", ["permanentStorageDate"] = "2026-08-01T10:02:00Z",
+                    ["netAmount"] = 100m, ["vatAmount"] = 23m, ["grossAmount"] = 123m, ["currency"] = "PLN"
+                };
+                if (damagedField is not null) invoice.Remove(damagedField);
+                return Json(HttpStatusCode.OK, JsonSerializer.Serialize(new
+                {
+                    hasMore = pagedMode && offset < 2, isTruncated = false,
+                    permanentStorageHwmDate = "2026-08-01T12:00:00Z", invoices = new[] { invoice }
+                }));
+            }
             metadataRequestTimes.Add(DateTimeOffset.UtcNow);
             Require(message.Headers.Authorization?.Parameter == expectedAccessToken, "Brak aktualnego AccessToken przy pobieraniu metadanych.");
             if (unauthorizedMetadataResponses > 0)
@@ -1275,7 +1319,8 @@ static async Task TestKsefProtocolAsync()
 
         if (path.EndsWith("/invoices/ksef/5265877635-20260801-TEST", StringComparison.Ordinal))
         {
-            Require(message.Headers.Authorization?.Parameter == "access-token", "Brak AccessToken przy pobieraniu XML faktury.");
+            if (unauthorizedXmlResponses-- > 0) return Json(HttpStatusCode.Unauthorized, "{}");
+            Require(message.Headers.Authorization?.Parameter == expectedAccessToken, "Brak AccessToken przy pobieraniu XML faktury.");
             invoiceDownloadSeen = true;
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
@@ -1295,6 +1340,11 @@ static async Task TestKsefProtocolAsync()
         metadataRequestReservation: _ =>
         {
             metadataProtocolReservations++;
+            return Task.CompletedTask;
+        },
+        invoiceRequestReservation: _ =>
+        {
+            xmlReservations++;
             return Task.CompletedTask;
         });
     using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1319,6 +1369,45 @@ static async Task TestKsefProtocolAsync()
     var downloadedXml = await client.DownloadInvoiceXmlAsync("5265877635-20260801-TEST", timeout.Token);
     Require(invoiceDownloadSeen && downloadedXml.Contains("FV/TEST/1", StringComparison.Ordinal),
         "Klient nie pobrał pełnego XML faktury po numerze KSeF.");
+    unauthorizedXmlResponses = 1;
+    _ = await client.DownloadInvoiceXmlAsync("5265877635-20260801-TEST", timeout.Token);
+    Require(xmlReservations == 3 && CountRequests(requestCounts, "/invoices/ksef/5265877635-20260801-TEST") == 3,
+        "Retry XML po 401 nie zarezerwowało osobnego żądania.");
+
+    foreach (var field in new[] { "grossAmount", "netAmount", "vatAmount", "issueDate", "currency", "ksefNumber" })
+    {
+        damagedField = field;
+        var rejected = false;
+        try { _ = await client.QueryReceivedInvoicesAsync(DateTimeOffset.UtcNow.AddMinutes(-1), timeout.Token); }
+        catch (KsefApiException) { rejected = true; }
+        Require(rejected, $"Zaakceptowano niepełne metadane bez pola {field}.");
+    }
+    damagedField = null;
+    pagedMode = true;
+    requestedPages.Clear();
+    MetadataQueryCheckpoint? checkpoint = null;
+    var resumeFrom = DateTimeOffset.UtcNow.AddMinutes(-1);
+    try
+    {
+        _ = await client.QueryReceivedInvoicesAsync(resumeFrom, timeout.Token, saveCheckpoint: next =>
+        {
+            checkpoint = JsonSerializer.Deserialize<MetadataQueryCheckpoint>(JsonSerializer.Serialize(next));
+            throw new OperationCanceledException("Symulowany restart po pierwszej stronie.");
+        });
+    }
+    catch (OperationCanceledException) { }
+    Require(checkpoint?.PageOffset == 1, "Nie zapisano kursora kolejnej strony przed restartem.");
+    var resumed = await client.QueryReceivedInvoicesAsync(resumeFrom, timeout.Token, checkpoint, next =>
+    {
+        checkpoint = next;
+        return Task.CompletedTask;
+    });
+    Require(requestedPages.Count == 3 && requestedPages[0] == 0 && requestedPages[1] == 1 &&
+            requestedPages[2] == 2 && resumed.Invoices.Count == 3,
+        "Wznowienie powtórzyło odebrane strony lub zgubiło dokumenty.");
+    _ = await client.QueryReceivedInvoicesAsync(resumeFrom, timeout.Token, checkpoint, _ => Task.CompletedTask);
+    Require(requestedPages.Count == 3, "Ukończony checkpoint niepotrzebnie ponownie odpytuje KSeF.");
+    pagedMode = false;
 
     metadataRanges.Clear();
     var longRangeFrom = DateTimeOffset.UtcNow.AddMonths(-3);

@@ -33,6 +33,7 @@ internal static class InvoiceXmlReader
         AddSummary(result, "Termin płatności", FirstValue(xdoc, "Termin", "PaymentDueDate", "DueDate"));
         AddSummary(result, "Forma płatności", FirstValue(xdoc, "FormaPlatnosci", "PlatnoscForma", "PaymentMeansCode"));
         AddSummary(result, "Do zapłaty", FirstValue(xdoc, "DoZaplaty", "PayableAmount", "DuePayableAmount"));
+        ReadPaymentStatus(xdoc, result);
 
         var subject1 = FirstElement(xdoc, "Podmiot1", "AccountingSupplierParty", "SellerTradeParty", "Seller", "Supplier");
         var subject2 = FirstElement(xdoc, "Podmiot2", "AccountingCustomerParty", "BuyerTradeParty", "Buyer", "Customer");
@@ -117,6 +118,33 @@ internal static class InvoiceXmlReader
 
         Flatten(xdoc.Root, $"/{xdoc.Root.Name.LocalName}", result.Fields);
         return result;
+    }
+
+    private static void ReadPaymentStatus(XDocument xdoc, InvoiceDocument result)
+    {
+        var payment = FirstElement(xdoc, "Platnosc");
+        var marker = FirstValue(payment, "ZnacznikZaplatyCzesciowej");
+        if (FirstValue(payment, "Zaplacono") == "1" || marker == "2")
+        {
+            result.Summary["Status płatności"] = "Zapłacono — według danych wystawcy";
+            result.Summary["Do zapłaty"] = "0.00";
+        }
+        else if (marker == "1")
+        {
+            result.Summary["Status płatności"] = "Zapłacono częściowo — według danych wystawcy";
+            var amounts = payment!.Descendants().Where(x => NameIs(x, "KwotaZaplatyCzesciowej")).ToList();
+            if (TryParseXmlDecimal(FirstValue(xdoc, "P_15"), out var total) && total >= 0 &&
+                amounts.Count > 0 && amounts.All(x => TryParseXmlDecimal(x.Value, out var amount) && amount >= 0))
+            {
+                try
+                {
+                    var paid = amounts.Sum(x => decimal.Parse(x.Value, CultureInfo.InvariantCulture));
+                    if (paid <= total) result.Summary["Do zapłaty"] = (total - paid).ToString(CultureInfo.InvariantCulture);
+                }
+                catch (OverflowException) { /* Nie zgadujemy salda niepoprawnych danych. */ }
+            }
+        }
+        else result.Summary["Status płatności"] = "Brak informacji o zapłacie w dokumencie";
     }
 
     private static (string VatAmount, string GrossAmount, bool IsVatCalculated, bool IsGrossCalculated) CompleteLineAmounts(

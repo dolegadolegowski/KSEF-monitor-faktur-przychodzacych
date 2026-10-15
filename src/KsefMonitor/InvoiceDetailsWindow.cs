@@ -299,9 +299,22 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
             host.Children.Add(BuildPreviewNotice(previewError, isError: true, canRetry));
 
         var lines = (IReadOnlyList<InvoiceLine>?)document?.Lines ?? Array.Empty<InvoiceLine>();
-        var pages = InvoicePagePlanner.Plan(lines, EstimateFirstPageHeaderExtraHeight(document));
         var hasNetUnitPrice = lines.Any(x => !string.IsNullOrWhiteSpace(x.UnitNetPrice));
         var hasGrossUnitPrice = lines.Any(x => !string.IsNullOrWhiteSpace(x.UnitGrossPrice));
+        static double MeasureBlock(FrameworkElement block)
+        {
+            block.Measure(new Size(A4Width - 84, double.PositiveInfinity));
+            return Math.Ceiling(block.DesiredSize.Height);
+        }
+        var firstCapacity = Math.Max(36, A4Height - 84 - 50 - 36 - MeasureBlock(BuildDocumentHeader(document)));
+        var continuationCapacity = Math.Max(36, A4Height - 84 - 50 - 36 -
+            MeasureBlock(BuildContinuationHeader(new InvoicePagePlan(Array.Empty<InvoiceLine>(), false, false, 2, 2))));
+        var summaryHeight = MeasureBlock(BuildTotalsAndPayment(document));
+        lines = PreparePrintableLines(lines, hasNetUnitPrice, hasGrossUnitPrice, Math.Min(500, firstCapacity));
+        var pages = InvoicePagePlanner.Plan(lines,
+            measureHeight: line => MeasurePrintableLine(line, hasNetUnitPrice, hasGrossUnitPrice),
+            firstPageLineCapacity: firstCapacity, continuationPageLineCapacity: continuationCapacity,
+            summaryReserve: summaryHeight);
         foreach (var page in pages)
             host.Children.Add(BuildA4Page(document, page, hasNetUnitPrice, hasGrossUnitPrice));
 
@@ -564,7 +577,7 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
         var panel = new StackPanel();
         panel.Children.Add(BuildLineGrid(null, isHeader: true, 32, hasNetUnitPrice, hasGrossUnitPrice));
         foreach (var line in lines)
-            panel.Children.Add(BuildLineGrid(line, isHeader: false, InvoicePagePlanner.EstimateLineHeight(line), hasNetUnitPrice, hasGrossUnitPrice));
+            panel.Children.Add(BuildLineGrid(line, isHeader: false, MeasurePrintableLine(line, hasNetUnitPrice, hasGrossUnitPrice), hasNetUnitPrice, hasGrossUnitPrice));
         return panel;
     }
 
@@ -575,7 +588,7 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
         bool hasNetUnitPrice,
         bool hasGrossUnitPrice)
     {
-        var grid = new Grid { Height = height, Background = isHeader ? Accent : Brushes.White, ClipToBounds = true };
+        var grid = new Grid { Height = height, MinHeight = 36, Background = isHeader ? Accent : Brushes.White };
         AddLineColumns(grid);
         var priceHeader = hasNetUnitPrice && hasGrossUnitPrice
             ? "Cena jedn.\nN/B"
@@ -609,8 +622,8 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
                 Foreground = isHeader ? Brushes.White : Ink,
                 FontWeight = isHeader ? FontWeights.SemiBold : FontWeights.Normal,
                 FontSize = isHeader ? 8.5 : 9,
-                TextWrapping = index == 1 || isHeader ? TextWrapping.Wrap : TextWrapping.NoWrap,
-                TextTrimming = isHeader ? TextTrimming.None : TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.Wrap,
+                TextTrimming = TextTrimming.None,
                 TextAlignment = index == 1 ? TextAlignment.Left : TextAlignment.Right,
                 VerticalAlignment = VerticalAlignment.Center
             };
@@ -622,13 +635,48 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
                 BorderBrush = isHeader ? new SolidColorBrush(Color.FromRgb(70, 112, 153)) : Rule,
                 BorderThickness = new Thickness(index == 0 ? 1 : 0, 0, 1, 1),
                 Padding = new Thickness(index == 1 ? 6 : 4, 3, index == 1 ? 6 : 4, 3),
-                ClipToBounds = true,
                 Child = text
             };
             Grid.SetColumn(cell, index);
             grid.Children.Add(cell);
         }
         return grid;
+    }
+
+    internal static double MeasurePrintableLine(InvoiceLine line, bool net = true, bool gross = false)
+    {
+        var row = BuildLineGrid(line, false, double.NaN, net, gross);
+        row.Measure(new Size(A4Width - 84, double.PositiveInfinity));
+        return Math.Ceiling(Math.Max(36, row.DesiredSize.Height));
+    }
+
+    internal static IReadOnlyList<InvoiceLine> PreparePrintableLines(IReadOnlyList<InvoiceLine> lines, bool net, bool gross,
+        double maximumHeight = 500)
+    {
+        var result = new List<InvoiceLine>();
+        foreach (var original in lines)
+        {
+            var remaining = original.Description;
+            var line = original;
+            while (MeasurePrintableLine(line with { Description = remaining }, net, gross) > maximumHeight && remaining.Length > 1)
+            {
+                var low = 1;
+                var high = remaining.Length;
+                while (low < high)
+                {
+                    var middle = (low + high + 1) / 2;
+                    if (MeasurePrintableLine(line with { Description = remaining[..middle] }, net, gross) <= maximumHeight) low = middle;
+                    else high = middle - 1;
+                }
+                // Nie rozdzielamy pary UTF-16 w połowie znaku.
+                if (low > 1 && char.IsHighSurrogate(remaining[low - 1]) && char.IsLowSurrogate(remaining[low])) low--;
+                result.Add(line with { Description = remaining[..low] });
+                remaining = remaining[low..];
+                line = new InvoiceLine($"{original.Number} cd.", remaining, "", "", "", "", "", "", "", "", "");
+            }
+            result.Add(line with { Description = remaining });
+        }
+        return result;
     }
 
     private static string FormatLineMoney(string value, bool isCalculated)
@@ -685,6 +733,7 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
         AddPaymentRow(payment, "Forma", FormatPaymentMethod(GetSummary(document, "Forma płatności")));
         AddPaymentRow(payment, "Termin", FormatDateText(GetSummary(document, "Termin płatności")));
         AddPaymentRow(payment, "Rachunek", GetSummary(document, "Rachunek bankowy"));
+        AddPaymentRow(payment, "Status", GetSummary(document, "Status płatności"));
         grid.Children.Add(payment);
 
         var totals = new StackPanel();
@@ -699,7 +748,7 @@ internal sealed class InvoiceDetailsWindow : Window, IDisposable
             Padding = new Thickness(10, 9, 10, 9),
             Margin = new Thickness(0, 7, 0, 0),
             Child = BuildTotalRowContent(
-                "DO ZAPŁATY",
+                string.IsNullOrWhiteSpace(payable) ? "WARTOŚĆ DOKUMENTU" : "DO ZAPŁATY WG DOKUMENTU",
                 string.IsNullOrWhiteSpace(payable)
                     ? $"{_invoice.GrossAmount:N2} {_invoice.Currency}"
                     : $"{InvoiceValueFormatter.Money(payable)} {_invoice.Currency}",
