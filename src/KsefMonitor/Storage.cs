@@ -19,6 +19,7 @@ internal static class AppPaths
         "KSeF Monitor");
 
     public static string SettingsFile => Path.Combine(Root, "settings.json");
+    public static string WindowPlacementFile => Path.Combine(Root, "window.json");
     public static string StateFile => Path.Combine(Root, "invoices.dat");
     public static string TokenFile => Path.Combine(Root, "credential.dat");
     public static string DownloadRateFile => Path.Combine(Root, "download-rate.dat");
@@ -54,6 +55,29 @@ internal sealed class AppStore
     public AppStore(ApplicationLog log) => Log = log;
 
     public ApplicationLog Log { get; }
+
+    public WindowPlacement? LoadWindowPlacement()
+    {
+        try
+        {
+            lock (_gate) return File.Exists(AppPaths.WindowPlacementFile)
+                ? JsonSerializer.Deserialize<WindowPlacement>(File.ReadAllText(AppPaths.WindowPlacementFile), JsonOptions) : null;
+        }
+        catch (Exception exception)
+        {
+            Log.Warning("Okno", "Nie odczytano poprzedniej pozycji okna.", exception);
+            return null;
+        }
+    }
+
+    public void SaveWindowPlacement(WindowPlacement placement)
+    {
+        try
+        {
+            lock (_gate) AtomicWrite(AppPaths.WindowPlacementFile, JsonSerializer.SerializeToUtf8Bytes(placement, JsonOptions));
+        }
+        catch (Exception exception) { Log.Warning("Okno", "Nie zapisano pozycji okna.", exception); }
+    }
 
     public string? ConsumeLoadWarning()
     {

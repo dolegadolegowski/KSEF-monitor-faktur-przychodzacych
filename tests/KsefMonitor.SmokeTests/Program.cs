@@ -45,6 +45,8 @@ TestCalculatedLineAmounts();
 TestPefUblLineVariant();
 TestA4Pagination();
 TestPaymentStatus();
+TestLocalInvoiceFilters();
+TestPdfStructure();
 TestMonthlyInvoiceSummary();
 TestInvoiceAmountSortKey();
 TestInvoiceNewState();
@@ -270,6 +272,46 @@ static void TestPaymentStatus()
     Require(!Parse("<Platnosc><ZnacznikZaplatyCzesciowej>1</ZnacznikZaplatyCzesciowej>" +
         "<ZaplataCzesciowa><KwotaZaplatyCzesciowej>999</KwotaZaplatyCzesciowej></ZaplataCzesciowa></Platnosc>")
         .Summary.ContainsKey("Do zapłaty"), "Niepoprawna suma wpłat wyznaczyła fałszywe saldo.");
+}
+
+static void TestLocalInvoiceFilters()
+{
+    var invoice = new StoredInvoice
+    {
+        KsefNumber = "KSEF-123", InvoiceNumber = "FV/10/2026", SellerName = "Klinika Żółta", SellerNip = "5265877635",
+        IssueDate = new DateOnly(2026, 10, 5), GrossAmount = -123m, Currency = "PLN", InvoiceType = "Kor"
+    };
+    var filter = new InvoiceListFilter(2026, 10, "klinika", true, true, "PLN");
+    Require(filter.Matches(invoice), "Wyszukiwanie i połączone filtry nie znajdują korekty.");
+    Require((filter with { Search = "526-587-76-35" }).Matches(invoice), "NIP z separatorami nie działa.");
+    Require(!(filter with { Currency = "EUR" }).Matches(invoice), "Filtr waluty miesza kwoty.");
+    Require(!(filter with { Month = 9 }).Matches(invoice), "Filtr miesiąca przepuszcza inne daty.");
+    var row = new InvoiceRow { Source = invoice };
+    var notifications = 0;
+    row.PropertyChanged += (_, _) => notifications++;
+    var updated = invoice.Snapshot();
+    updated.ViewedAtUtc = DateTimeOffset.UtcNow;
+    row.Update(updated);
+    Require(!row.IsNew && notifications == 1 && !filter.Matches(row.Source), "Otwarta faktura nie aktualizuje oznaczenia i filtra NOWE.");
+}
+
+static void TestPdfStructure()
+{
+    using var buffer = new MemoryStream();
+    InvoicePdfWriter.Write(buffer, [new InvoicePageImage([255, 216, 255, 217], 1, 1)]);
+    var text = Encoding.Latin1.GetString(buffer.ToArray());
+    Require(text.StartsWith("%PDF-1.4", StringComparison.Ordinal) && text.Contains("/Count 1", StringComparison.Ordinal),
+        "Eksport nie tworzy dokumentu PDF.");
+    var start = text.IndexOf("xref\n", StringComparison.Ordinal);
+    var pointer = text.IndexOf("startxref\n", StringComparison.Ordinal) + "startxref\n".Length;
+    Require(long.Parse(text[pointer..].Split('\n')[0], CultureInfo.InvariantCulture) == start,
+        "Tabela odnośników PDF ma niepoprawne położenie.");
+    var entries = text[start..].Split('\n').Skip(3).Take(5).ToList();
+    for (var index = 0; index < entries.Count; index++)
+    {
+        var offset = int.Parse(entries[index][..10], CultureInfo.InvariantCulture);
+        Require(text[offset..].StartsWith($"{index + 1} 0 obj", StringComparison.Ordinal), "Odnośnik obiektu PDF jest niepoprawny.");
+    }
 }
 
 static void TestStateContextIsolation()

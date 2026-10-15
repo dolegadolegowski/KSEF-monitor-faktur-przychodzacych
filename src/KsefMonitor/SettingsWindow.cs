@@ -37,6 +37,7 @@ internal sealed class SettingsWindow : Window
     private readonly TextBlock _myDrLastError = new();
     private readonly Button _myDrSaveButton = new();
     private readonly Button _myDrRefreshButton = new();
+    private readonly Button _myDrCancelButton = new() { Content = "Anuluj pobieranie", IsEnabled = false };
     private readonly Button _myDrDeleteButton = new();
     private readonly TextBlock _updateStatus = new();
     private readonly TextBlock _updateVersion = new();
@@ -66,10 +67,10 @@ internal sealed class SettingsWindow : Window
         _myDr = myDr;
         _updates = updates;
         Title = "Ustawienia aplikacji";
-        Width = 700;
-        Height = 620;
-        MinWidth = 620;
-        MinHeight = 540;
+        Width = Math.Min(700, SystemParameters.WorkArea.Width - 24);
+        Height = Math.Min(620, SystemParameters.WorkArea.Height - 24);
+        MinWidth = 480;
+        MinHeight = 300;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
         ResizeMode = ResizeMode.CanResize;
         Icon = TrayIconFactory.CreateImageSource();
@@ -85,6 +86,7 @@ internal sealed class SettingsWindow : Window
         _myDrStatusTimer.Tick += (_, _) => RefreshMyDrStatus();
         _myDrStatusTimer.Start();
         _updates.StateChanged += OnUpdateStateChanged;
+        _myDr.StatusChanged += OnMyDrProgress;
         Loaded += async (_, _) => await CheckUpdatesOnOpenAsync().ConfigureAwait(true);
         Closing += (_, e) =>
         {
@@ -99,7 +101,7 @@ internal sealed class SettingsWindow : Window
             }
             _isClosing = true;
             _testCancellation?.Cancel();
-            _myDrCancellation?.Cancel();
+            _myDr.StatusChanged -= OnMyDrProgress;
             _myDrStatusTimer.Stop();
             _updates.StateChanged -= OnUpdateStateChanged;
         };
@@ -110,11 +112,11 @@ internal sealed class SettingsWindow : Window
     private TabControl BuildContent()
     {
         var tabs = new TabControl { Margin = new Thickness(14) };
-        var ksefTab = new TabItem { Header = "KSeF", Content = BuildConnectionContent() };
+        var ksefTab = new TabItem { Header = "KSeF", Content = new ScrollViewer { Content = BuildConnectionContent(), VerticalScrollBarVisibility = ScrollBarVisibility.Auto } };
         var myDrTab = new TabItem { Header = "MyDR", Content = BuildMyDrContent() };
         tabs.Items.Add(ksefTab);
         tabs.Items.Add(myDrTab);
-        var updatesTab = new TabItem { Header = "Aktualizacje", Content = BuildUpdatesContent() };
+        var updatesTab = new TabItem { Header = "Aktualizacje", Content = new ScrollViewer { Content = BuildUpdatesContent(), VerticalScrollBarVisibility = ScrollBarVisibility.Auto } };
         tabs.Items.Add(updatesTab);
         _logTab = new TabItem { Header = "Dziennik", Content = BuildLogContent() };
         tabs.Items.Add(_logTab);
@@ -158,14 +160,14 @@ internal sealed class SettingsWindow : Window
         form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         for (var i = 0; i < 6; i++) form.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        AddLabel(form, "NIP firmy", 0);
+        AddLabel(form, "NIP firmy", 0, _nip);
         _nip.Margin = new Thickness(0, 0, 0, 14);
         _nip.MaxLength = 13;
         Grid.SetRow(_nip, 0);
         Grid.SetColumn(_nip, 1);
         form.Children.Add(_nip);
 
-        AddLabel(form, "Token KSeF", 1);
+        AddLabel(form, "Token KSeF", 1, _token);
         _token.Margin = new Thickness(0, 0, 0, 4);
         Grid.SetRow(_token, 1);
         Grid.SetColumn(_token, 1);
@@ -269,21 +271,21 @@ internal sealed class SettingsWindow : Window
         form.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         for (var i = 0; i < 6; i++) form.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        AddLabel(form, "Client ID", 0);
+        AddLabel(form, "Client ID", 0, _myDrClientId);
         _myDrClientId.Margin = new Thickness(0, 0, 0, 14);
         _myDrClientId.MaxLength = 500;
         Grid.SetRow(_myDrClientId, 0);
         Grid.SetColumn(_myDrClientId, 1);
         form.Children.Add(_myDrClientId);
 
-        AddLabel(form, "Client secret", 1);
+        AddLabel(form, "Client secret", 1, _myDrClientSecret);
         _myDrClientSecret.Margin = new Thickness(0, 0, 0, 14);
         _myDrClientSecret.MaxLength = 16_384;
         Grid.SetRow(_myDrClientSecret, 1);
         Grid.SetColumn(_myDrClientSecret, 1);
         form.Children.Add(_myDrClientSecret);
 
-        AddLabel(form, "Refresh token", 2);
+        AddLabel(form, "Refresh token", 2, _myDrRefreshToken);
         _myDrRefreshToken.Margin = new Thickness(0, 0, 0, 5);
         _myDrRefreshToken.MaxLength = 16_384;
         Grid.SetRow(_myDrRefreshToken, 2);
@@ -322,6 +324,10 @@ internal sealed class SettingsWindow : Window
         _myDrRefreshButton.Margin = new Thickness(0, 0, 10, 8);
         _myDrRefreshButton.Click += async (_, _) => await RefreshMyDrNowAsync().ConfigureAwait(true);
         actions.Children.Add(_myDrRefreshButton);
+        _myDrCancelButton.Margin = new Thickness(0, 0, 10, 8);
+        _myDrCancelButton.Padding = new Thickness(14, 7, 14, 7);
+        _myDrCancelButton.Click += async (_, _) => await _myDr.CancelCurrentSynchronizationAsync().ConfigureAwait(true);
+        actions.Children.Add(_myDrCancelButton);
 
         _myDrDeleteButton.Content = "Usuń dane MyDR";
         _myDrDeleteButton.Padding = new Thickness(14, 7, 14, 7);
@@ -802,6 +808,7 @@ internal sealed class SettingsWindow : Window
             // pobierania po dawnych pięciu minutach.
             timeout = new CancellationTokenSource(TimeSpan.FromMinutes(30));
             _myDrCancellation = timeout;
+            _myDrCancelButton.IsEnabled = true;
             await _myDr.RefreshNowAsync(timeout.Token).ConfigureAwait(true);
             if (!_isClosing)
             {
@@ -840,6 +847,7 @@ internal sealed class SettingsWindow : Window
             timeout?.Dispose();
             if (!_isClosing)
             {
+                _myDrCancelButton.IsEnabled = false;
                 SetMyDrBusy(false);
                 RefreshMyDrStatus();
             }
@@ -892,6 +900,7 @@ internal sealed class SettingsWindow : Window
         try
         {
             var status = _myDr.GetStatusSnapshot();
+            _myDrCancelButton.IsEnabled = status.IsSynchronizing;
             _myDrCredentialsStatus.Text = status.IsConfigured ? "Zapisane" : "Nie skonfigurowano";
             _myDrCredentialsStatus.Foreground = status.IsConfigured ? Brushes.SeaGreen : Brushes.DimGray;
             _myDrLastAttempt.Text = FormatMyDrDate(status.LastAttemptUtc, "Jeszcze nie wykonywano");
@@ -1051,21 +1060,34 @@ internal sealed class SettingsWindow : Window
         _myDrActionStatus.Foreground = isError ? Brushes.Firebrick : Brushes.SeaGreen;
     }
 
+    private void OnMyDrProgress(object? sender, AppStatusMessage message)
+    {
+        if (_isClosing) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            if (!_isClosing) SetMyDrActionStatus(message.Text, message.IsError);
+        });
+    }
+
     private void SetStatus(string text, bool isError)
     {
         _status.Text = text;
         _status.Foreground = isError ? Brushes.Firebrick : Brushes.SeaGreen;
     }
 
-    private static void AddLabel(Grid form, string text, int row)
+    private static void AddLabel(Grid form, string text, int row, UIElement target)
     {
-        var label = new TextBlock
+        var label = new Label
         {
-            Text = text,
+            Content = text,
+            Target = target,
+            Padding = new Thickness(0),
             VerticalAlignment = VerticalAlignment.Center,
             Margin = new Thickness(0, 0, 16, 14),
             FontWeight = FontWeights.SemiBold
         };
+        System.Windows.Automation.AutomationProperties.SetLabeledBy(target, label);
+        System.Windows.Automation.AutomationProperties.SetName(target, text);
         Grid.SetRow(label, row);
         form.Children.Add(label);
     }

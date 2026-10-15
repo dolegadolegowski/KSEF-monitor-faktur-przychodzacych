@@ -25,6 +25,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
     private readonly object _scheduleGate = new();
     private readonly object _lifecycleGate = new();
     private CancellationTokenSource _configurationChanged = new();
+    private CancellationTokenSource? _activeSyncCancellation;
     private MyDrCredentials? _credentials;
     private readonly MyDrState _state;
     private Timer? _timer;
@@ -180,6 +181,11 @@ internal sealed class MyDrSynchronizationService : IDisposable
     public Task RefreshNowAsync(CancellationToken cancellationToken = default) =>
         SynchronizeAsync(manual: true, cancellationToken);
 
+    public Task CancelCurrentSynchronizationAsync()
+    {
+        lock (_lifecycleGate) return _activeSyncCancellation?.CancelAsync() ?? Task.CompletedTask;
+    }
+
     private async void TimerElapsed(object? state)
     {
         if (state is not long generation || !TryConsumeTimer(generation)) return;
@@ -248,6 +254,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
             }
 
             linkedConfiguration = CancellationTokenSource.CreateLinkedTokenSource(operationToken, configurationToken);
+            lock (_lifecycleGate) _activeSyncCancellation = linkedConfiguration;
             var syncToken = linkedConfiguration.Token;
             var today = MyDrDailySchedule.GetWarsawDate(DateTimeOffset.UtcNow);
             var alreadyChecked = WithCurrentState(configurationVersionAtStart, () =>
@@ -414,9 +421,11 @@ internal sealed class MyDrSynchronizationService : IDisposable
             _log.Info("MyDR", $"Zakończono odświeżanie obrotu. Wizyty: {newCache.Count}; miesiące: {summaries.Count}; zapytania o usługi: {serviceRequestCount}; trafienia cache: {serviceCacheHitCount}.");
             SetStatus($"Obrót MyDR odświeżono o {DateTime.Now:HH:mm}.");
         }
-        catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested || cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (_shutdownToken.IsCancellationRequested || cancellationToken.IsCancellationRequested ||
+                                               linkedConfiguration?.IsCancellationRequested == true)
         {
             _log.Info("MyDR", "Odświeżanie MyDR zostało zatrzymane.");
+            SetStatus("Odświeżanie MyDR zostało przerwane. Ostatnie poprawne kwoty pozostają bez zmian.");
             if (manual && !_shutdownToken.IsCancellationRequested) throw;
         }
         catch (OperationCanceledException) when (
@@ -438,6 +447,7 @@ internal sealed class MyDrSynchronizationService : IDisposable
         }
         finally
         {
+            lock (_lifecycleGate) _activeSyncCancellation = null;
             if (!finalSnapshotCommitted && partialVisitCache is { Count: > 0 } partial &&
                 partial.Count > checkpointedVisitCount)
                 TrySaveVisitCacheCheckpoint(configurationVersionAtStart, partial);

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
@@ -8,6 +9,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Documents;
+using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -25,6 +27,18 @@ internal sealed class MainWindow : Window
     private readonly MyDrSynchronizationService _myDrSynchronization;
     private readonly AppUpdateService _updates;
     private readonly DataGrid _grid = new();
+    private readonly ObservableCollection<InvoiceRow> _rows = new();
+    private readonly TextBox _search = new();
+    private readonly CheckBox _onlyNew = new() { Content = "Tylko NOWE" };
+    private readonly CheckBox _onlyCorrections = new() { Content = "Korekty" };
+    private readonly ComboBox _currency = new() { MinWidth = 85 };
+    private readonly TextBlock _filteredSummary = new();
+    private readonly TextBlock _freshness = new();
+    private readonly TextBlock _emptyMessage = new();
+    private string _ksefActivity = string.Empty;
+    private bool _ksefFailed;
+    private bool _refreshingRows;
+    private WindowState _lastVisibleState = WindowState.Normal;
     private readonly TextBlock _monthLabel = new();
     private readonly TextBlock _ksefMonthSummary = new();
     private readonly TextBlock _myDrMonthSummary = new();
@@ -59,13 +73,14 @@ internal sealed class MainWindow : Window
         _myDrSynchronization = myDrSynchronization;
         _updates = updates;
         Title = "KSeF Monitor — Faktury otrzymane";
-        Width = 1040;
-        Height = 680;
-        MinWidth = 820;
-        MinHeight = 520;
+        Width = Math.Min(1040, SystemParameters.WorkArea.Width - 24);
+        Height = Math.Min(680, SystemParameters.WorkArea.Height - 24);
+        MinWidth = 600;
+        MinHeight = 300;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = new SolidColorBrush(Color.FromRgb(246, 248, 251));
         Content = BuildContent();
+        RestoreWindowPlacement();
 
         _trayIcon = TrayIconFactory.Create();
         Icon = TrayIconFactory.CreateImageSource(_trayIcon);
@@ -92,6 +107,10 @@ internal sealed class MainWindow : Window
             if (!IsMyDrDoctorTurnoverPopupActive()) HideMyDrDoctorTurnoverPopup();
         };
         _clock.Start();
+        SizeChanged += (_, e) =>
+        {
+            if (e.WidthChanged && (e.PreviousSize.Width < 960) != (e.NewSize.Width < 960)) RefreshRows();
+        };
         RefreshRows();
         ApplyUpdateUi(_updates.GetSnapshot());
     }
@@ -172,7 +191,7 @@ internal sealed class MainWindow : Window
         header.Child = headerGrid;
         root.Children.Add(header);
 
-        _grid.ItemsSource = Array.Empty<InvoiceRow>();
+        _grid.ItemsSource = _rows;
         _grid.AutoGenerateColumns = false;
         _grid.IsReadOnly = true;
         _grid.CanUserAddRows = false;
@@ -229,7 +248,7 @@ internal sealed class MainWindow : Window
         _grid.Columns.Add(new DataGridTextColumn { Header = string.Empty, Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.NewLabel)), Width = 68, ElementStyle = newLabelStyle });
         var rowTextStyle = new Style(typeof(TextBlock));
         rowTextStyle.Setters.Add(new Setter(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center));
-        _grid.Columns.Add(new DataGridTextColumn { Header = "Data wystawienia", Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.IssueDate)), Width = 130, ElementStyle = rowTextStyle });
+        _grid.Columns.Add(new DataGridTextColumn { Header = "Data wystawienia", Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.IssueDate)), SortMemberPath = nameof(InvoiceRow.IssueDateSortValue), Width = 130, ElementStyle = rowTextStyle });
         _grid.Columns.Add(new DataGridTextColumn { Header = "Sprzedawca", Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.Seller)), Width = new DataGridLength(1, DataGridLengthUnitType.Star), ElementStyle = rowTextStyle });
         _grid.Columns.Add(new DataGridTextColumn { Header = "Numer faktury", Binding = new System.Windows.Data.Binding(nameof(InvoiceRow.InvoiceNumber)), Width = 180, ElementStyle = rowTextStyle });
         var amountStyle = new Style(typeof(TextBlock), rowTextStyle);
@@ -245,8 +264,64 @@ internal sealed class MainWindow : Window
         });
         _grid.PreviewMouseLeftButtonUp += OnGridMouseLeftButtonUp;
         _grid.PreviewKeyDown += OnGridPreviewKeyDown;
+        var listArea = new Grid();
+        listArea.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        listArea.RowDefinitions.Add(new RowDefinition());
+        var filters = new DockPanel { Margin = new Thickness(24, 10, 24, 0), LastChildFill = true };
+        var choices = new WrapPanel { VerticalAlignment = VerticalAlignment.Center };
+        foreach (var choice in new[] { _onlyNew, _onlyCorrections })
+        {
+            choice.Margin = new Thickness(12, 4, 0, 4);
+            choice.VerticalAlignment = VerticalAlignment.Center;
+            choice.Checked += (_, _) => ApplyLocalFilters();
+            choice.Unchecked += (_, _) => ApplyLocalFilters();
+            choices.Children.Add(choice);
+        }
+        _currency.Items.Add("Wszystkie waluty");
+        _currency.SelectedIndex = 0;
+        _currency.Margin = new Thickness(12, 0, 0, 0);
+        _currency.SelectionChanged += (_, _) => ApplyLocalFilters();
+        choices.Children.Add(_currency);
+        var clearFilters = new Button { Content = "Wyczyść", Padding = new Thickness(6, 3, 6, 3), Margin = new Thickness(8, 0, 0, 0) };
+        clearFilters.Click += (_, _) =>
+        {
+            _refreshingRows = true;
+            _search.Clear();
+            _onlyNew.IsChecked = false;
+            _onlyCorrections.IsChecked = false;
+            _currency.SelectedIndex = 0;
+            _refreshingRows = false;
+            ApplyLocalFilters();
+        };
+        choices.Children.Add(clearFilters);
+        DockPanel.SetDock(choices, Dock.Right);
+        filters.Children.Add(choices);
+        var searchLabel = new Label { Content = "_Szukaj:", Target = _search, VerticalAlignment = VerticalAlignment.Center };
+        DockPanel.SetDock(searchLabel, Dock.Left);
+        filters.Children.Add(searchLabel);
+        _search.ToolTip = "Szukaj po sprzedawcy, NIP-ie, numerze faktury lub numerze KSeF. Ctrl+F";
+        _search.MinWidth = 110;
+        _search.Padding = new Thickness(7, 5, 7, 5);
+        _search.TextChanged += (_, _) => ApplyLocalFilters();
+        AutomationProperties.SetName(_search, "Szukaj faktury po sprzedawcy, NIP-ie lub numerze");
+        filters.Children.Add(_search);
+        listArea.Children.Add(filters);
         Grid.SetRow(_grid, 1);
-        root.Children.Add(_grid);
+        listArea.Children.Add(_grid);
+        _emptyMessage.HorizontalAlignment = HorizontalAlignment.Center;
+        _emptyMessage.VerticalAlignment = VerticalAlignment.Center;
+        _emptyMessage.TextAlignment = TextAlignment.Center;
+        _emptyMessage.TextWrapping = TextWrapping.Wrap;
+        _emptyMessage.MaxWidth = 500;
+        _emptyMessage.Margin = new Thickness(30);
+        _emptyMessage.IsHitTestVisible = false;
+        Grid.SetRow(_emptyMessage, 1);
+        listArea.Children.Add(_emptyMessage);
+        Grid.SetRow(listArea, 1);
+        root.Children.Add(listArea);
+        var view = CollectionViewSource.GetDefaultView(_rows);
+        view.SortDescriptions.Add(new SortDescription(nameof(InvoiceRow.IssueDateSortValue), ListSortDirection.Descending));
+        view.SortDescriptions.Add(new SortDescription(nameof(InvoiceRow.StorageDateSortValue), ListSortDirection.Descending));
 
         var footer = new Border
         {
@@ -262,7 +337,16 @@ internal sealed class MainWindow : Window
         var footerGrid = new Grid();
         footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         footerGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        footerGrid.Children.Add(_status);
+        var statusPanel = new StackPanel();
+        _filteredSummary.FontSize = 11;
+        _filteredSummary.TextWrapping = TextWrapping.Wrap;
+        _freshness.FontSize = 11;
+        _freshness.TextWrapping = TextWrapping.Wrap;
+        _freshness.Foreground = Brushes.DimGray;
+        statusPanel.Children.Add(_filteredSummary);
+        statusPanel.Children.Add(_freshness);
+        statusPanel.Children.Add(_status);
+        footerGrid.Children.Add(statusPanel);
         var footerActions = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -285,6 +369,18 @@ internal sealed class MainWindow : Window
         _versionButton.Padding = new Thickness(8, 3, 8, 3);
         _versionButton.Cursor = Cursors.Hand;
         _versionButton.ToolTip = "Otwórz ustawienia aplikacji";
+        AutomationProperties.SetName(_versionButton, "Ustawienia aplikacji i numer wersji");
+        AutomationProperties.SetName(_previousMonth, "Poprzedni miesiąc. Alt+strzałka w lewo");
+        AutomationProperties.SetName(_nextMonth, "Następny miesiąc. Alt+strzałka w prawo");
+        AutomationProperties.SetName(_refreshButton, "Odśwież faktury. F5");
+        PreviewKeyDown += (_, e) =>
+        {
+            var key = e.Key == Key.System ? e.SystemKey : e.Key;
+            if (key == Key.F && Keyboard.Modifiers == ModifierKeys.Control) { _search.Focus(); e.Handled = true; }
+            else if (key == Key.F5) { _ = RefreshManuallyAsync(); e.Handled = true; }
+            else if (Keyboard.Modifiers == ModifierKeys.Alt && key is Key.Left or Key.Right)
+            { ChangeMonth(key == Key.Left ? -1 : 1); e.Handled = true; }
+        };
         _versionButton.Click += (_, _) => OpenSettings();
         footerActions.Children.Add(_versionButton);
         Grid.SetColumn(footerActions, 1);
@@ -304,6 +400,31 @@ internal sealed class MainWindow : Window
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add("Wyjdź", null, (_, _) => Dispatcher.Invoke(() => ((App)System.Windows.Application.Current).ExitApplication()));
         return menu;
+    }
+
+    private void RestoreWindowPlacement()
+    {
+        var saved = _store.LoadWindowPlacement();
+        if (saved is null || !double.IsFinite(saved.Left + saved.Top + saved.Width + saved.Height) ||
+            saved.Width < MinWidth || saved.Height < MinHeight) return;
+        var desktop = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+        var bounds = new Rect(saved.Left, saved.Top, saved.Width, saved.Height);
+        if (!desktop.Contains(bounds)) return;
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = saved.Left;
+        Top = saved.Top;
+        Width = saved.Width;
+        Height = saved.Height;
+        if (saved.Maximized) WindowState = _lastVisibleState = WindowState.Maximized;
+    }
+
+    private void SaveWindowPlacement()
+    {
+        var bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, ActualWidth, ActualHeight) : RestoreBounds;
+        if (bounds.IsEmpty || bounds.Width < MinWidth || bounds.Height < MinHeight) return;
+        _store.SaveWindowPlacement(new WindowPlacement(bounds.Left, bounds.Top, bounds.Width, bounds.Height,
+            _lastVisibleState == WindowState.Maximized));
     }
 
     [SuppressMessage("Globalization", "CA1303:Do not pass literals as localized parameters", Justification = "Nazwa produktu KSeF Monitor nie podlega lokalizacji.")]
@@ -447,6 +568,28 @@ internal sealed class MainWindow : Window
         _nextMonth.IsEnabled = _displayMonth < current;
 
         var snapshot = _synchronization.GetInvoicesSnapshot();
+        var selected = _grid.SelectedItem as InvoiceRow;
+        var scroll = FindVisualDescendant<ScrollViewer>(_grid);
+        var verticalOffset = scroll?.VerticalOffset ?? 0;
+        var horizontalOffset = scroll?.HorizontalOffset ?? 0;
+        _refreshingRows = true;
+        var byNumber = _rows.ToDictionary(row => row.Source.KsefNumber, StringComparer.Ordinal);
+        var validNumbers = snapshot.Select(invoice => invoice.KsefNumber).ToHashSet(StringComparer.Ordinal);
+        foreach (var obsolete in _rows.Where(row => !validNumbers.Contains(row.Source.KsefNumber)).ToList()) _rows.Remove(obsolete);
+        foreach (var invoice in snapshot)
+            if (byNumber.TryGetValue(invoice.KsefNumber, out var row)) row.Update(invoice);
+            else _rows.Add(new InvoiceRow { Source = invoice });
+        var selectedCurrency = _currency.SelectedItem as string;
+        var currencies = snapshot.Select(invoice => invoice.Currency).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(x => x).ToList();
+        if (!_currency.Items.Cast<string>().Skip(1).SequenceEqual(currencies))
+        {
+            _currency.Items.Clear();
+            _currency.Items.Add("Wszystkie waluty");
+            foreach (var currency in currencies) _currency.Items.Add(currency);
+            _currency.SelectedItem = selectedCurrency is not null && _currency.Items.Contains(selectedCurrency)
+                ? selectedCurrency : "Wszystkie waluty";
+        }
+        _refreshingRows = false;
         var items = snapshot
             .Where(x => x.IssueDate.Year == _displayMonth.Year && x.IssueDate.Month == _displayMonth.Month)
             .OrderByDescending(x => x.IsNew)
@@ -455,7 +598,13 @@ internal sealed class MainWindow : Window
             .Select(x => new InvoiceRow { Source = x })
             .ToList();
 
-        _grid.ItemsSource = items;
+        ApplyLocalFilters();
+        if (selected is not null && _grid.Items.Contains(selected)) _grid.SelectedItem = selected;
+        if (scroll is not null) Dispatcher.BeginInvoke(() =>
+        {
+            scroll.ScrollToVerticalOffset(verticalOffset);
+            scroll.ScrollToHorizontalOffset(horizontalOffset);
+        }, DispatcherPriority.Loaded);
         var grossTotals = MonthlyInvoiceSummary.FormatGrossTotals(items.Select(item => item.Source));
         var invoiceCounts = items.Count == 0
             ? "Brak faktur"
@@ -473,12 +622,33 @@ internal sealed class MainWindow : Window
             FontWeight = FontWeights.SemiBold,
             Foreground = new SolidColorBrush(Color.FromRgb(43, 55, 70))
         });
-        _ksefMonthSummary.Inlines.Add(new Run($"  •  {invoiceCounts}") { FontSize = 12.5 });
+        _ksefMonthSummary.Inlines.Add(new Run(ActualWidth > 0 && ActualWidth < 960 ? "" : $"  •  {invoiceCounts}") { FontSize = 12.5 });
         _ksefMonthSummary.ToolTip = $"{invoiceCounts}  •  {grossTotals}\nKwoty w różnych walutach są sumowane oddzielnie.";
         RefreshMyDrSummary();
         var allNewCount = snapshot.Count(x => x.IsNew);
         _notifyIcon.Text = allNewCount == 0 ? "KSeF Monitor" : $"KSeF Monitor — nowe: {allNewCount}";
         UpdateSyncLabels();
+    }
+
+    private void ApplyLocalFilters()
+    {
+        if (_refreshingRows) return;
+        var currency = _currency.SelectedIndex > 0 ? _currency.SelectedItem as string : null;
+        var filter = new InvoiceListFilter(_displayMonth.Year, _displayMonth.Month, _search.Text,
+            _onlyNew.IsChecked == true, _onlyCorrections.IsChecked == true, currency);
+        var view = CollectionViewSource.GetDefaultView(_rows);
+        view.Filter = item => item is InvoiceRow row && filter.Matches(row.Source);
+        var visible = view.Cast<InvoiceRow>().ToList();
+        _filteredSummary.Text = $"Widoczne: {visible.Count}  •  " +
+            MonthlyInvoiceSummary.FormatGrossTotals(visible.Select(row => row.Source)).Replace("Łącznie brutto:", "Suma widocznych:", StringComparison.Ordinal);
+        _emptyMessage.Visibility = visible.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        _emptyMessage.Text = !_synchronization.IsConfigured
+            ? "Połącz aplikację z KSeF.\nKliknij numer wersji w prawym dolnym rogu, aby otworzyć ustawienia."
+            : _synchronization.IsSynchronizing ? "Trwa pobieranie faktur…"
+            : _synchronization.GetLastSuccessfulSyncUtc() is null ? "Lista nie została jeszcze pobrana.\nKliknij przycisk odświeżania."
+            : _search.Text.Length > 0 || _onlyNew.IsChecked == true || _onlyCorrections.IsChecked == true || currency is not null
+                ? "Brak faktur pasujących do filtrów.\nZmień wyszukiwanie lub wyłącz filtry."
+                : "Brak faktur w wybranym miesiącu.";
     }
 
     private void UpdateSyncLabels()
@@ -487,11 +657,17 @@ internal sealed class MainWindow : Window
             ? $"Ostatnie odświeżenie: {last.ToLocalTime():dd.MM.yyyy HH:mm}"
             : "Jeszcze nie odświeżono";
         _refreshButton.ToolTip = $"{lastSyncText}\nKliknij, aby natychmiast sprawdzić nowe faktury.";
+        var myDr = _myDrSynchronization.GetStatusSnapshot();
+        var myDrDate = myDr.LastSuccessfulSyncUtc is { } md ? md.ToLocalTime().ToString("dd.MM HH:mm", CultureInfo.GetCultureInfo("pl-PL")) : "brak danych";
+        _freshness.Text = $"KSeF: {lastSyncText.Replace("Ostatnie odświeżenie: ", "", StringComparison.Ordinal)}" +
+            (_ksefFailed ? " — ostatnia próba nieudana" : "") + $"  •  MyDR: {myDrDate}" +
+            (myDr.IsSynchronizing ? " — obliczanie…" : !myDr.IsConfigured ? " — nieskonfigurowany" :
+                !string.IsNullOrEmpty(myDr.LastError) ? " — ostatnia próba nieudana" : "");
 
         if (_synchronization.IsSynchronizing)
         {
-            _refreshButton.Content = "00:00";
-            _refreshButton.ToolTip = $"{lastSyncText}\nTrwa odświeżanie faktur.";
+            _refreshButton.Content = "•••";
+            _refreshButton.ToolTip = $"{lastSyncText}\n{_ksefActivity}";
             _refreshButton.IsEnabled = false;
             return;
         }
@@ -607,7 +783,16 @@ internal sealed class MainWindow : Window
     }
 
     private void OnStatusChanged(object? sender, AppStatusMessage status) =>
-        Dispatcher.InvokeAsync(() => ShowStatus(status));
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (ReferenceEquals(sender, _synchronization))
+            {
+                _ksefActivity = status.Text;
+                _ksefFailed = status.IsError;
+            }
+            ShowStatus(status);
+            UpdateSyncLabels();
+        });
 
     private void ShowStatus(AppStatusMessage status)
     {
@@ -708,7 +893,7 @@ internal sealed class MainWindow : Window
         {
             BaselineAlignment = BaselineAlignment.Center
         });
-        _myDrMonthSummary.Inlines.Add(new Run($"  •  wizyty: {summary.VisitCount}  •  usługi: {summary.ServiceCount}")
+        _myDrMonthSummary.Inlines.Add(new Run(ActualWidth > 0 && ActualWidth < 960 ? "" : $"  •  wizyty: {summary.VisitCount}  •  usługi: {summary.ServiceCount}")
         {
             FontSize = 12.5
         });
@@ -1012,7 +1197,7 @@ internal sealed class MainWindow : Window
 
     private void OnWindowStateChanged(object? sender, EventArgs e)
     {
-        if (WindowState != WindowState.Minimized) return;
+        if (WindowState != WindowState.Minimized) { _lastVisibleState = WindowState; return; }
         HideMyDrDoctorTurnoverPopup();
         Hide();
         if (!_minimizeHintShown)
@@ -1026,14 +1211,20 @@ internal sealed class MainWindow : Window
     {
         if (_reallyClose) return;
         e.Cancel = true;
+        SaveWindowPlacement();
         HideMyDrDoctorTurnoverPopup();
         Hide();
+        if (!_minimizeHintShown)
+        {
+            _minimizeHintShown = true;
+            _notifyIcon.ShowBalloonTip(4000, "KSeF Monitor", "Okno zostało schowane. Otworzysz je ikoną KSeF obok zegara; opcja Wyjdź kończy działanie.", Forms.ToolTipIcon.Info);
+        }
     }
 
     internal void ShowFromTray()
     {
         Show();
-        WindowState = WindowState.Normal;
+        WindowState = _lastVisibleState;
         Activate();
         Topmost = true;
         Topmost = false;
@@ -1044,6 +1235,7 @@ internal sealed class MainWindow : Window
     {
         if (_reallyClose) return;
         _reallyClose = true;
+        SaveWindowPlacement();
         _clock.Stop();
         CloseMyDrDoctorTurnoverPopup();
         _myDrPopupCloseTimer.Stop();

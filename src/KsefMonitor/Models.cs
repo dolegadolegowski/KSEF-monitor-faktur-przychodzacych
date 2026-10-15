@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
 using System.Net;
@@ -19,6 +20,8 @@ internal sealed class AppSettings
 
     public static Uri GetBaseUri() => new("https://api.ksef.mf.gov.pl/v2/");
 }
+
+internal sealed record WindowPlacement(double Left, double Top, double Width, double Height, bool Maximized);
 
 internal sealed class AppState
 {
@@ -323,11 +326,19 @@ internal sealed class InvoiceDocument
     public Dictionary<string, string> Summary { get; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
-internal sealed class InvoiceRow
+internal sealed class InvoiceRow : INotifyPropertyChanged
 {
     private static readonly CultureInfo PolishCulture = CultureInfo.GetCultureInfo("pl-PL");
 
-    public required StoredInvoice Source { get; init; }
+    public required StoredInvoice Source { get; set; }
+    public event PropertyChangedEventHandler? PropertyChanged;
+    public void Update(StoredInvoice source)
+    {
+        Source = source;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
+    }
+    public DateOnly IssueDateSortValue => Source.IssueDate;
+    public DateTimeOffset? StorageDateSortValue => Source.PermanentStorageDate;
     public bool IsNew => Source.IsNew;
     public string NewLabel => Source.IsNew ? "NOWA" : string.Empty;
     public string IssueDate => Source.IssueDate == DateOnly.MinValue
@@ -337,6 +348,24 @@ internal sealed class InvoiceRow
     public string InvoiceNumber => Source.InvoiceNumber;
     public decimal GrossAmountSortValue => Source.GrossAmount;
     public string GrossAmount => $"{Source.GrossAmount.ToString("N2", PolishCulture)} {Source.Currency}";
+}
+
+internal sealed record InvoiceListFilter(int Year, int Month, string Search, bool NewOnly, bool CorrectionsOnly, string? Currency)
+{
+    public bool Matches(StoredInvoice invoice)
+    {
+        if (invoice.IssueDate.Year != Year || invoice.IssueDate.Month != Month ||
+            NewOnly && !invoice.IsNew || CorrectionsOnly &&
+            !invoice.InvoiceType.StartsWith("Kor", StringComparison.OrdinalIgnoreCase) && invoice.GrossAmount >= 0 ||
+            Currency is not null && !string.Equals(invoice.Currency, Currency, StringComparison.OrdinalIgnoreCase)) return false;
+        var query = Search.Trim();
+        if (query.Length == 0) return true;
+        var comparison = CultureInfo.GetCultureInfo("pl-PL").CompareInfo;
+        return new[] { invoice.SellerName, invoice.SellerNip, invoice.InvoiceNumber, invoice.KsefNumber }
+            .Any(value => comparison.IndexOf(value, query, CompareOptions.IgnoreCase | CompareOptions.IgnoreNonSpace) >= 0) ||
+            (query.Any(char.IsDigit) && query.All(c => char.IsDigit(c) || c is '-' or ' ') &&
+             invoice.SellerNip.Contains(NipValidator.Normalize(query), StringComparison.Ordinal));
+    }
 }
 
 internal static class NipValidator

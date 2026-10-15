@@ -2,9 +2,16 @@
 
 Desktopowa aplikacja Windows 11 do monitorowania faktur otrzymanych w Krajowym Systemie e-Faktur (KSeF API 2.0) oraz miesięcznego obrotu usług prywatnych z MyDR.
 
-Aktualny etap: działająca wersja `0.7.1`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
+Aktualny etap: działająca wersja `0.8.0`. Aplikacja łączy się wyłącznie z produkcyjnymi API KSeF (`https://api.ksef.mf.gov.pl/v2/`) i MyDR (`https://edm.mydr.pl/secure/ext_api/`) i nie udostępnia wyboru środowiska.
 
 ## Zaimplementowane
+
+- lokalna wyszukiwarka, filtry NOWE/korekt/waluty i odrębna suma widocznych wyników;
+- zachowanie sortowania, zaznaczenia i przewinięcia listy przy odświeżeniu;
+- widoczne daty poprawnej aktualizacji KSeF i MyDR oraz komunikaty pustej listy;
+- dopasowanie i zoom A4, drukowanie, zapis PDF jako obrazu stron 144 DPI oraz eksport oryginalnego XML;
+- zapamiętywanie pozycji i maksymalizacji okna, układ dla mniejszych ekranów oraz skróty Ctrl+F, F5, Alt+strzałki;
+- postęp i anulowanie MyDR; zamknięcie ustawień chowa widok postępu, a pobieranie nadal działa w tle;
 
 - logowanie tokenem KSeF w kontekście NIP;
 - pobieranie aktualnego klucza publicznego i obsługa `publicKeyId`;
@@ -135,6 +142,7 @@ Jest to samodzielny plik `win-x64`, zawierający runtime .NET. Aplikacja tworzy 
 ```
 
 - `settings.json` — niesekretne ustawienia;
+- `window.json` — pozycja, rozmiar i stan maksymalizacji okna;
 - `credential.dat` — token chroniony DPAPI;
 - `invoices.dat` — metadane, statusy i XML-e chronione DPAPI;
 - `download-rate.dat` — mały, chroniony DPAPI licznik limitu pobierania XML;
